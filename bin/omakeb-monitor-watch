@@ -1,0 +1,190 @@
+#!/bin/bash
+
+# omakeb:summary=Repair the bar after a display hotplug leaves duplicate copies stacked at the top. (internal)
+
+# WHY THIS EXISTS
+#
+# waybar draws one layer surface per output. It learns about outputs from the
+# wl_output globals the compositor advertises, adding a bar on announce and
+# removing it on destroy. That bookkeeping is only correct while announce and
+# destroy arrive in matched pairs.
+#
+# On a DP connector that re-trains its link — a TV that drops the signal when it
+# sleeps, blanks, or switches input, which is exactly what the LG panel on the
+# test machine does — Hyprland tears the monitor down and brings it back within
+# a few seconds, several times in a row. Its event stream does not survive that
+# cleanly: a single flap burst was observed emitting one destroy against three
+# announces (and `hyprctl` will happily print monitorremoved three times for one
+# real removal). waybar believes it, and every unmatched announce leaves another
+# 34px bar stacked under the last one. The reserved area grows with them, so the
+# whole desktop shifts down — three bars means `reserved: 0 102 0 0`.
+#
+# Nothing in the session notices, because from waybar's point of view every bar
+# it is drawing is one it was told to draw. The surplus only goes away when
+# waybar is restarted, which is what this does.
+#
+# It is a workaround for a compositor/bar interaction, not a fix for either, so
+# it is written to be as close to inert as possible: it acts only on a genuine
+# surplus, only after the topology has stopped moving, and it disarms itself
+# rather than fight a configuration it does not understand.
+
+set -uo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+# Seconds of quiet before we believe the topology has settled. A flap burst runs
+# for several seconds; reconciling mid-burst would restart waybar into a display
+# that is about to disappear again.
+SETTLE=${OMAKEB_MONITOR_SETTLE:-4}
+
+# Set once we conclude the surplus is intentional — see reconcile().
+disarmed=0
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Hyprland mints a new instance signature every time it starts, and
+# omakeb-daemon detaches us with `setsid` so we outlive the compositor we were
+# started under. Trusting the signature we inherited would leave us watching a
+# socket that no longer exists after a compositor restart — while omakeb-daemon,
+# seeing us still on the process table, declines to start a replacement. So
+# re-resolve every time, and adopt the live instance wholesale: hyprctl reads
+# HYPRLAND_INSTANCE_SIGNATURE too, and it has to agree with the socket we picked.
+socket2_path() {
+  local base="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/hypr" sig sock
+
+  sig=${HYPRLAND_INSTANCE_SIGNATURE:-}
+  if [[ -n $sig && -S $base/$sig/.socket2.sock ]]; then
+    printf '%s\n' "$base/$sig/.socket2.sock"
+    return 0
+  fi
+
+  # Newest instance first, so we land on the current compositor and not a
+  # directory some earlier session left behind.
+  for sig in $(ls -t "$base" 2>/dev/null); do
+    sock=$base/$sig/.socket2.sock
+    if [[ -S $sock ]]; then
+      export HYPRLAND_INSTANCE_SIGNATURE=$sig
+      printf '%s\n' "$sock"
+      return 0
+    fi
+  done
+  return 1
+}
+
+monitor_count() {
+  # -j lists enabled outputs only, which is the same set waybar has globals for.
+  hyprctl monitors -j 2>/dev/null | jq 'length' 2>/dev/null || printf '0\n'
+}
+
+bar_count() {
+  hyprctl layers -j 2>/dev/null |
+    jq '[.[] | .levels[][] | select(.namespace == "waybar")] | length' 2>/dev/null ||
+    printf '0\n'
+}
+
+# One bar per output is the healthy state for the config we ship. Restart only
+# when there are MORE bars than outputs.
+#
+# Fewer is never touched: pinning the bar to one output with `"output":` in
+# config.jsonc is a legitimate customisation, and so is hiding it entirely.
+reconcile() {
+  (( disarmed )) && return 0
+
+  # The bar-hidden toggle stops waybar.service on purpose. Restarting it here
+  # would undo the toggle behind the user's back.
+  service_running waybar.service waybar || return 0
+
+  local monitors bars
+  monitors=$(monitor_count)
+  bars=$(bar_count)
+  [[ $monitors =~ ^[0-9]+$ && $bars =~ ^[0-9]+$ ]] || return 0
+  (( monitors > 0 )) || return 0
+  (( bars > monitors )) || return 0
+
+  service_restart waybar.service waybar
+  sleep 3
+
+  # If the surplus survives a restart it was never a leak — the user's
+  # config.jsonc is an array of bar definitions, so more bars than outputs is
+  # correct for them. Stop reconciling instead of restarting waybar forever.
+  local after
+  after=$(bar_count)
+  if [[ $after =~ ^[0-9]+$ ]] && (( after > monitors )); then
+    disarmed=1
+    log_warn "omakeb-monitor-watch: $after bars on $monitors output(s) after a restart; assuming a multi-bar config and standing down"
+  fi
+}
+
+# What happens once the topology has stopped moving.
+#
+# Mode and scale first: an output that just appeared is on whatever Hyprland
+# picked for it, and omakeb-monitor-apply is what decides otherwise. Changing a
+# mode makes waybar reconfigure its bars, so the surplus check has to run after
+# that has happened rather than race it.
+settled() {
+  if command -v omakeb-monitor-apply >/dev/null 2>&1; then
+    omakeb-monitor-apply >/dev/null 2>&1 || true
+    sleep 2
+  fi
+  reconcile
+}
+
+# Consume socket2 until it closes, reconciling once the events stop.
+#
+# `read -t` is the debounce: a timeout (status > 128) means SETTLE seconds
+# passed with nothing new, which is our signal that the flap burst is over. A
+# plain non-zero status is EOF — the compositor went away — and ends the loop so
+# the caller can reconnect.
+watch_stream() {
+  local line rc pending=0
+  while true; do
+    IFS= read -r -t "$SETTLE" line; rc=$?
+    if (( rc == 0 )); then
+      case $line in
+        monitoradded*|monitorremoved*) pending=1 ;;
+      esac
+    elif (( rc > 128 )); then
+      (( pending )) && { settled; pending=0; }
+    else
+      return 1
+    fi
+  done
+}
+
+# SINGLE INSTANCE
+#
+# autostart.conf wraps us in omakeb-daemon, which does recognise a script and
+# will not start a second copy. This lock is the belt to that braces: two
+# watchers would both restart waybar on the same event, and nothing about being
+# started by hand — debugging, or a session started bare from a TTY — goes
+# through omakeb-daemon at all.
+#
+# One watcher per user, however we were started.
+lockfile="${XDG_RUNTIME_DIR:-${OMAKEB_STATE}}/omakeb-monitor-watch.lock"
+if have flock; then
+  mkdir -p "$(dirname "$lockfile")" 2>/dev/null
+  if exec 9>"$lockfile"; then
+    # A watcher is already up; leaving it alone is the whole point.
+    flock -n 9 || exit 0
+  fi
+fi
+
+for tool in hyprctl jq socat; do
+  have "$tool" || {
+    log_warn "omakeb-monitor-watch: $tool is missing; duplicate bars after a display hotplug will not be repaired"
+    exit 0
+  }
+done
+
+while true; do
+  if sock=$(socket2_path); then
+    # A hotplug that happened while we were not listening (our own restart, or a
+    # flap during session startup) leaves a surplus no event will ever announce
+    # again, so check once on connect.
+    settled
+    watch_stream < <(socat -U - "UNIX-CONNECT:$sock" 2>/dev/null)
+  fi
+  # Compositor gone or not up yet. Retrying costs nothing and means this
+  # survives a Hyprland restart without needing to be restarted itself.
+  sleep 5
+done

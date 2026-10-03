@@ -1,0 +1,45 @@
+#!/bin/bash
+
+# omakeb:summary=Pick an entry from clipboard history and put it back on the clipboard.
+
+# cliphist is the whole history store: `wl-paste --watch cliphist store` (started
+# from the session autostart) records every selection, `cliphist list` prints one
+# id-prefixed preview line per entry, and `cliphist decode` turns a picked line
+# back into the original bytes. Nothing here keeps state of its own.
+#
+# Bound to SUPER+CTRL+V.
+
+set -euo pipefail
+
+note() {
+  notify-send -h string:x-canonical-private-synchronous:omakeb-clipboard \
+    "Clipboard" "$1" 2>/dev/null || true
+}
+
+fail() {
+  notify-send -u critical -h string:x-canonical-private-synchronous:omakeb-clipboard \
+    "Clipboard" "$1" 2>/dev/null || true
+  echo "omakeb-menu-clipboard: $1" >&2
+  exit 1
+}
+
+for cmd in cliphist fuzzel wl-copy; do
+  command -v "$cmd" >/dev/null || fail "$cmd is not installed."
+done
+
+history=$(cliphist list) || fail "cliphist could not read its history."
+[[ -n $history ]] || { note "History is empty."; exit 0; }
+
+# Escape and an empty pick are both "changed my mind", not failures.
+entry=$(fuzzel --dmenu --prompt='Clipboard  ' --width=80 <<<"$history") || exit 0
+[[ -n $entry ]] || exit 0
+
+# cliphist previews non-text entries as `[[ binary data 41 KiB png 1920x1080 ]]`.
+# Those have to go back on the clipboard with their real MIME type — pasted as
+# text/plain, an image is silently useless. Text entries take the default type.
+if [[ $entry == *"[[ binary data"* ]]; then
+  subtype=$(sed -n 's/.*\[\[ binary data [^ ]* [^ ]* \([[:alnum:]]*\).*/\1/p' <<<"$entry")
+  cliphist decode <<<"$entry" | wl-copy --type "image/${subtype:-png}"
+else
+  cliphist decode <<<"$entry" | wl-copy
+fi

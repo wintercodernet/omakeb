@@ -1,0 +1,32 @@
+#!/bin/bash
+
+# omakeb:summary=Apply the current night light state to the display.
+
+# Debian enables hyprsunset.service, and on a uwsm session systemd starts it; on
+# a session that never reaches graphical-session.target,
+# bin/omakeb-session-daemons does. Either way it is running by the time this is
+# called — and its default is 6000K, not neutral. That means a fresh session
+# arrives with an unrequested warm tint unless something actively clears it.
+#
+# So night light is a property we set over IPC, not a process we start and stop.
+# The toggle state file remains the source of truth: `identity` applies the
+# no-op colour matrix but does NOT reset the stored temperature, so reading the
+# temperature back is not a reliable "is it on" test.
+#
+# Called at login by omakeb-session-daemons — after hyprsunset is up, which is
+# the first moment there is anything to talk to — and again by
+# omakeb-toggle-nightlight.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+temperature=${OMAKEB_NIGHTLIGHT_TEMP:-4000}
+
+command -v hyprctl >/dev/null 2>&1 || exit 0
+
+if [[ -e "$OMAKEB_STATE/toggles/nightlight" ]]; then
+  hyprctl hyprsunset temperature "$temperature" >/dev/null
+else
+  hyprctl hyprsunset identity >/dev/null
+fi

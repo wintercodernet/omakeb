@@ -1,0 +1,52 @@
+# omakeb — Hyprland entry point.
+#
+# Rendered by install/60-config.sh to ~/.config/hypr/hyprland.conf with the
+# @PLACEHOLDERS@ substituted. Do not edit the rendered file: it is regenerated
+# on every update. Put your own settings in @OMAKEB_CONFIG@/, which is seeded
+# once and never touched again.
+#
+# hyprlang strips everything after an unescaped '#' on any line, and '##' is the
+# escape for a literal hash (hyprlang config.cpp:688-716).
+
+# --- omakeb defaults ----------------------------------------------------------
+source = @OMAKEB_PATH@/default/hypr/bindings/applications.conf
+source = @OMAKEB_PATH@/default/hypr/bindings/tiling.conf
+source = @OMAKEB_PATH@/default/hypr/bindings/media.conf
+source = @OMAKEB_PATH@/default/hypr/bindings/clipboard.conf
+source = @OMAKEB_PATH@/default/hypr/bindings/utilities.conf
+
+source = @OMAKEB_PATH@/default/hypr/envs.conf
+source = @OMAKEB_PATH@/default/hypr/input.conf
+source = @OMAKEB_PATH@/default/hypr/looknfeel.conf
+source = @OMAKEB_PATH@/default/hypr/windows.conf
+
+# --- keyboard -----------------------------------------------------------------
+# Rendered by install/60-config.sh from /etc/default/keyboard, so the layout you
+# picked when you installed Debian is the one the compositor and hyprlock use.
+# After input.conf so it wins over our defaults, before the user's files so it
+# loses to theirs.
+source = @CONFIG_HOME@/hypr/keyboard.conf
+
+# --- theme ---------------------------------------------------------------------
+# Rendered by omakeb-theme-set from the active palette, and sourced AFTER
+# looknfeel.conf so it overrides that file's colours and leaves its geometry
+# alone. looknfeel.conf keeps a full set of colours of its own on purpose: it
+# has to parse standalone, and this file may not exist yet on a half-finished
+# install. hyprlang treats a missing `source =` target as a config error, so
+# install/70-theme.sh renders it before anything parses this.
+source = @CONFIG_HOME@/hypr/colors.conf
+
+# autostart.conf is last of ours on purpose: its exec-once lines read toggle
+# state and re-apply gaps and opacity on top of whatever looknfeel.conf just
+# set, so it has to be parsed after the file it corrects.
+source = @OMAKEB_PATH@/default/hypr/autostart.conf
+
+# --- user overrides -----------------------------------------------------------
+# Sourced last, so anything here wins. Rebinding a key that omakeb already binds
+# does NOT replace it — Hyprland runs both dispatchers. Use `unbind` first:
+#
+#   unbind = SUPER, RETURN
+#   bindd  = SUPER, RETURN, My terminal, exec, foot
+#
+source = @OMAKEB_CONFIG@/bindings.conf
+source = @OMAKEB_CONFIG@/hyprland.conf

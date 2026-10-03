@@ -1,0 +1,33 @@
+#!/bin/bash
+
+# omakeb:summary=Toggle locking and screen blanking on idle.
+
+# hypridle is the whole idle policy (dim, lock, DPMS off), so stopping it is
+# how you keep the session awake through a film or a long build. The toggle
+# name is the non-default condition: no state file means hypridle runs.
+#
+# Debian ships hypridle.service and enables it, so systemd owns it under uwsm.
+# See lib/units.sh.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+state=$OMAKEB_STATE/toggles/idle-inhibited
+
+notify() {
+  notify-send -a omakeb -i "$2" \
+    -h string:x-canonical-private-synchronous:omakeb-toggle-idle \
+    "Locking on idle" "$1"
+}
+
+if [[ -e $state ]]; then
+  service_up hypridle.service hypridle
+  rm -f "$state"
+  notify "On" system-lock-screen
+else
+  service_down hypridle.service hypridle
+  mkdir -p "${state%/*}"
+  : > "$state"
+  notify "Off — the session will stay awake" preferences-desktop-screensaver
+fi

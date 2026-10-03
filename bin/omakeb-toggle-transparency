@@ -1,0 +1,65 @@
+#!/bin/bash
+
+# omakeb:summary=Toggle window transparency.
+
+# Same shape as omakeb-toggle-gaps: the opaque values are read out of the
+# running compositor before we override them, so restoring cannot drift from
+# looknfeel.conf. Only the opacity keywords are touched — blur is left alone,
+# since turning it on here would change the look of themes that never asked
+# for it.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+state=$OMAKEB_STATE/toggles/transparency
+stash=transparency-values
+
+# option=value applied while the toggle is on.
+transparent=(
+  decoration:active_opacity=0.92
+  decoration:inactive_opacity=0.82
+)
+
+notify() {
+  notify-send -a omakeb -i "$2" \
+    -h string:x-canonical-private-synchronous:omakeb-toggle-transparency \
+    "Window transparency" "$1"
+}
+
+option_value() {
+  hyprctl -j getoption "$1" |
+    jq -r 'if (.custom // "") != "" then .custom
+           elif has("float") then (.float | tostring)
+           elif has("int")   then (.int   | tostring)
+           else (.str // "") end'
+}
+
+if [[ -e $state ]]; then
+  saved=$(state_get "$stash")
+  if [[ -n $saved ]]; then
+    while IFS='=' read -r option value; do
+      [[ -n $option && -n $value ]] || continue
+      hyprctl keyword "$option" "$value" >/dev/null
+    done <<<"$saved"
+  else
+    hyprctl reload >/dev/null
+  fi
+  rm -f "$state"
+  notify "Off" window-close
+else
+  values=()
+  for pair in "${transparent[@]}"; do
+    option=${pair%%=*}
+    values+=("$option=$(option_value "$option")")
+  done
+  state_set "$stash" "$(printf '%s\n' "${values[@]}")"
+
+  for pair in "${transparent[@]}"; do
+    hyprctl keyword "${pair%%=*}" "${pair#*=}" >/dev/null
+  done
+
+  mkdir -p "${state%/*}"
+  : > "$state"
+  notify "On" window-new
+fi

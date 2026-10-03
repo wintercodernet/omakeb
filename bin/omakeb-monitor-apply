@@ -1,0 +1,139 @@
+#!/bin/bash
+
+# omakeb:summary=Put every display on its best mode, and scale a display above 4K by 2.
+
+# Hyprland's shipped default is `monitor = , preferred, auto, auto`, and
+# `preferred` is the EDID's own preferred mode — which is not the best one a
+# panel can do. The test machine is the case in point: an 8K TV whose EDID
+# prefers 3840x2160@60 while the same EDID also offers 7680x4320@59.94. Left on
+# `preferred` it ran at a quarter of its pixels.
+#
+# The other half is scale. hyprlang has no conditionals, so a static config
+# cannot say "2x on a display above 4K and leave the rest alone" — it can only
+# name a scale per output, which means knowing every output in advance. So the
+# policy lives here, applied at session start and again whenever the monitor
+# topology settles (bin/omakeb-monitor-watch).
+#
+# WHAT IT DOES NOT TOUCH: any output the user has written their own `monitor =`
+# rule for in ~/.config/omakeb/hyprland.conf. That file is theirs and it is
+# sourced last precisely so it wins; a runtime helper that overrode it half a
+# second after login would make it useless. A catch-all rule (`monitor = , ...`)
+# counts as covering every output, so one line opts out of the whole policy.
+
+set -uo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+# "Over 4K" means wider than DCI 4K. 3840x2160 and 4096x2160 are both 4K and
+# keep the default scale; 5120x2880 and 7680x4320 are above it and get 2.
+#
+# Deliberately a width test rather than a pixel count: 4096x2160 has more pixels
+# than 3840x2160 without being any more "over 4K" than it is, and doubling the
+# scale on a DCI 4K panel would be wrong.
+OVER_4K_WIDTH=${OMAKEB_OVER_4K_WIDTH:-4096}
+
+# The scale for anything above that. `auto` everywhere else, which is what the
+# shipped default already does and is right for the high-DPI laptop panels where
+# a fractional scale is the sensible answer.
+OVER_4K_SCALE=${OMAKEB_OVER_4K_SCALE:-2}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+for tool in hyprctl jq; do
+  have "$tool" || { log_warn "omakeb-monitor-apply: $tool is missing"; exit 0; }
+done
+hyprctl monitors -j >/dev/null 2>&1 || exit 0
+
+# Outputs the user has claimed. Comments are stripped first: the seeded
+# hyprland.conf is mostly commented-out examples naming eDP-1 and DP-1, and
+# reading those as real rules would opt every machine out of the policy on a
+# fresh install.
+user_ruled_outputs() {
+  local f="$OMAKEB_CONFIG/hyprland.conf"
+  [[ -r $f ]] || return 0
+  sed 's/#.*//' "$f" |
+    sed -n 's/^[[:space:]]*monitor[[:space:]]*=[[:space:]]*\([^,]*\).*/\1/p' |
+    sed 's/[[:space:]]*$//'
+}
+
+# Best mode: most pixels, and among those the highest refresh. Not left to
+# Hyprland's `highres`, which picks a resolution and leaves the refresh rate to
+# its own tie-breaking — on this TV the 8K modes include 59.94, 50 and 29.97,
+# and landing on 29.97 would look like a fix that made things worse.
+best_mode() {
+  jq -r '
+    [ .availableModes[]
+      | capture("^(?<w>[0-9]+)x(?<h>[0-9]+)@(?<r>[0-9.]+)Hz$")
+      | { w: (.w|tonumber), h: (.h|tonumber), r: (.r|tonumber) } ]
+    | if length == 0 then empty
+      else sort_by([.w * .h, .r]) | last
+        # Recomputed rather than interpolated straight: jq 1.7 preserves the
+        # original literal of a number, so "@60.00Hz" comes back out as "60.00"
+        # on one jq and "60" on another. Hyprland accepts both; a test comparing
+        # exact strings does not.
+        | "\(.w)x\(.h)@\((.r * 100 | round) / 100)"
+      end
+  '
+}
+
+# Read with a loop, not `mapfile`: that is bash 4.4+, and test/run-all.sh runs
+# the suite on macOS's bash 3.2, where it would silently leave this array empty
+# and every user rule would be ignored — on the test host only, which is the
+# worst place for a difference to hide.
+claimed=()
+while IFS= read -r _line; do
+  claimed+=("$_line")
+done < <(user_ruled_outputs)
+unset _line
+
+monitors=$(hyprctl monitors -j 2>/dev/null) || exit 0
+count=$(printf '%s' "$monitors" | jq 'length')
+[[ ${count:-0} -gt 0 ]] || exit 0
+
+for i in $(seq 0 $((count - 1))); do
+  mon=$(printf '%s' "$monitors" | jq ".[$i]")
+  name=$(printf '%s' "$mon" | jq -r '.name')
+
+  skip=
+  for c in ${claimed[@]+"${claimed[@]}"}; do
+    # An empty name is a catch-all rule and covers everything.
+    [[ -z $c || $c == "$name" ]] && { skip=1; break; }
+  done
+  if [[ -n $skip ]]; then
+    log_skip "$name: a monitor rule in ${OMAKEB_CONFIG/#$HOME/\~}/hyprland.conf covers this output"
+    continue
+  fi
+
+  mode=$(printf '%s' "$mon" | best_mode)
+  [[ -n $mode ]] || { log_skip "$name: no parseable modes"; continue; }
+
+  width=${mode%%x*}
+  height=${mode#*x}; height=${height%%@*}
+
+  scale=auto
+  if (( width > OVER_4K_WIDTH )); then
+    # A scale only works if it divides the mode into whole logical pixels;
+    # Hyprland rejects one that does not, and a rejected rule leaves the output
+    # on whatever it had. Fall back rather than emit something that cannot apply.
+    if (( width % OVER_4K_SCALE == 0 && height % OVER_4K_SCALE == 0 )); then
+      scale=$OVER_4K_SCALE
+    else
+      log_skip "$name: ${mode} does not divide by $OVER_4K_SCALE; leaving the scale automatic"
+    fi
+  fi
+
+  # Only speak up when something would change. Re-applying an identical rule is
+  # harmless but makes every hotplug look like it did something.
+  cur_mode=$(printf '%s' "$mon" | jq -r '"\(.width)x\(.height)@\(.refreshRate)"')
+  cur_scale=$(printf '%s' "$mon" | jq -r '.scale')
+  if [[ ${cur_mode%.*} == "${mode%.*}" ]] &&
+     { [[ $scale == auto ]] || [[ ${cur_scale%.*} == "$scale" ]]; }; then
+    log_skip "$name: already ${mode} at scale ${cur_scale}"
+    continue
+  fi
+
+  if hyprctl keyword monitor "$name,$mode,auto,$scale" >/dev/null 2>&1; then
+    log_ok "$name: $mode, scale $scale"
+  else
+    log_warn "$name: could not apply $mode at scale $scale"
+  fi
+done

@@ -1,0 +1,61 @@
+#!/bin/bash
+
+# omakeb:summary=Toggle window gaps, borders and rounding for a full-bleed layout.
+
+# The "gaps on" values are never hardcoded: they are read out of the running
+# compositor with `hyprctl getoption` before being zeroed, so this keeps working
+# when looknfeel.conf changes. They are stashed outside toggles/ because C3 says
+# toggle state files carry no contents. If the stash is missing we fall back to
+# `hyprctl reload`, which restores whatever the config declares.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+state=$OMAKEB_STATE/toggles/no-gaps
+stash=gaps-values
+options=(general:gaps_in general:gaps_out general:border_size decoration:rounding)
+
+notify() {
+  notify-send -a omakeb -i "$2" \
+    -h string:x-canonical-private-synchronous:omakeb-toggle-gaps \
+    "Window gaps" "$1"
+}
+
+# getoption reports the value under a key named after its type: gaps are a
+# custom (CSS-style) type, borders and rounding are ints.
+option_value() {
+  hyprctl -j getoption "$1" |
+    jq -r 'if (.custom // "") != "" then .custom
+           elif has("int")   then (.int   | tostring)
+           elif has("float") then (.float | tostring)
+           else (.str // "") end'
+}
+
+if [[ -e $state ]]; then
+  saved=$(state_get "$stash")
+  if [[ -n $saved ]]; then
+    while IFS='=' read -r option value; do
+      [[ -n $option && -n $value ]] || continue
+      hyprctl keyword "$option" "$value" >/dev/null
+    done <<<"$saved"
+  else
+    hyprctl reload >/dev/null
+  fi
+  rm -f "$state"
+  notify "On" view-grid
+else
+  values=()
+  for option in "${options[@]}"; do
+    values+=("$option=$(option_value "$option")")
+  done
+  state_set "$stash" "$(printf '%s\n' "${values[@]}")"
+
+  for option in "${options[@]}"; do
+    hyprctl keyword "$option" 0 >/dev/null
+  done
+
+  mkdir -p "${state%/*}"
+  : > "$state"
+  notify "Off" view-fullscreen
+fi

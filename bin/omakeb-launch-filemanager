@@ -1,0 +1,57 @@
+#!/bin/bash
+
+# omakeb:summary=Open the graphical file manager.
+# omakeb:args=[path]
+
+# FILE_MANAGER defaults to thunar (C2), but the default is only reached for
+# real if thunar is installed — a user on a different desktop stack should get
+# their own file manager rather than a dead key.
+
+set -euo pipefail
+
+notify() {
+  command -v notify-send >/dev/null &&
+    notify-send -a omakeb \
+      -h string:x-canonical-private-synchronous:omakeb-launch "$@" || true
+}
+
+load_apps_conf() {
+  local conf="${OMAKEB_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/omakeb}/apps.conf"
+  [[ -r $conf ]] || return 0
+  set +e
+  # shellcheck source=/dev/null
+  source "$conf"
+  set -e
+}
+
+detect_filemanager() {
+  local candidate
+  for candidate in thunar nautilus nemo pcmanfm pcmanfm-qt dolphin xdg-open; do
+    if command -v "$candidate" >/dev/null; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+load_apps_conf
+
+fm_argv=()
+if [[ -n ${FILE_MANAGER:-} ]]; then
+  read -r -a fm_argv <<<"$FILE_MANAGER"
+fi
+if ((${#fm_argv[@]} == 0)) || ! command -v "${fm_argv[0]}" >/dev/null; then
+  fm=$(detect_filemanager) || {
+    notify "omakeb" "No file manager found. Install thunar, or set FILE_MANAGER in apps.conf."
+    exit 1
+  }
+  fm_argv=("$fm")
+fi
+
+# xdg-open has no "open my home" default the way a file manager does.
+if (($# == 0)) && [[ ${fm_argv[0]} == xdg-open ]]; then
+  set -- "$HOME"
+fi
+
+exec "${fm_argv[@]}" "$@"

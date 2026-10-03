@@ -1,0 +1,77 @@
+#!/bin/bash
+
+# omakeb:summary=Run a terminal program in a floating window.
+# omakeb:args=<command> [args...]
+
+# Used for the "panel"-shaped tools that upstream Omarchy draws in Quickshell
+# (btop for activity, D1) — a TUI in a small floating window reads like a panel
+# and needs no shell of our own.
+#
+# Floating is not requested from the launcher: Hyprland decides, from the window
+# class set below. The matching rule belongs in default/hypr/windows.conf, which
+# another agent owns:
+#
+#   windowrule = match:class ^(omakeb-float)$, float true
+#   windowrule = match:class ^(omakeb-float)$, size monitor_w*0.6 monitor_h*0.6
+#   windowrule = match:class ^(omakeb-float)$, center true
+#
+# NB: this is Hyprland 0.55 syntax. `windowrulev2` is a hard parse error there
+# (ConfigManager.cpp:432), and the old `windowrule = float, class:...` form no
+# longer parses either — every field is `<key> <value>` and matches are
+# `match:`-prefixed. `size` takes muParser expressions with no internal spaces.
+#
+# Without that rule the window still opens; it just tiles like any other.
+
+set -euo pipefail
+
+FLOAT_CLASS=omakeb-float
+
+notify() {
+  command -v notify-send >/dev/null &&
+    notify-send -a omakeb \
+      -h string:x-canonical-private-synchronous:omakeb-launch "$@" || true
+}
+
+load_apps_conf() {
+  local conf="${OMAKEB_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/omakeb}/apps.conf"
+  [[ -r $conf ]] || return 0
+  set +e
+  # shellcheck source=/dev/null
+  source "$conf"
+  set -e
+}
+
+if (($# == 0)); then
+  notify "omakeb" "omakeb-launch-tui needs a command to run."
+  exit 2
+fi
+
+load_apps_conf
+TERMINAL=${TERMINAL:-kitty}
+
+if ! command -v "$TERMINAL" >/dev/null; then
+  notify "omakeb" "Terminal '$TERMINAL' is not installed. Check apps.conf."
+  exit 1
+fi
+if ! command -v "$1" >/dev/null; then
+  notify "omakeb" "'$1' is not installed."
+  exit 1
+fi
+
+title=${1##*/}
+
+# Spellings differ by terminal. kitty maps --class to the Wayland app_id, which
+# is what Hyprland matches on. An unknown terminal gets no class, so its window
+# will not match the float rule — deliberate, and better than a bogus flag that
+# stops the terminal from starting at all.
+case "${TERMINAL##*/}" in
+  foot | footclient)
+    exec "$TERMINAL" "--app-id=$FLOAT_CLASS" "--title=$title" "$@"
+    ;;
+  kitty | alacritty | ghostty)
+    exec "$TERMINAL" --class "$FLOAT_CLASS" --title "$title" -e "$@"
+    ;;
+  *)
+    exec "$TERMINAL" -e "$@"
+    ;;
+esac

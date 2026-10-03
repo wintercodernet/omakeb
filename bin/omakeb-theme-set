@@ -1,0 +1,246 @@
+#!/bin/bash
+
+# omakeb:summary=Switch the desktop theme and reload every themed app in place.
+# omakeb:args=[--no-reload] [theme]
+
+# Renders every templates/*.tpl from the theme's palette, writes the results
+# into ~/.config, and reloads the apps that can take a new colour without
+# restarting. With no theme name it re-applies the current one, which is what
+# makes this the repair command as well as the switch command.
+#
+# ORDER MATTERS. Everything is rendered into a staging directory first and the
+# results are only copied into ~/.config once every template has succeeded. A
+# template that fails leaves the staging directory in place for inspection and
+# changes nothing else: a half-themed desktop is worse than the theme you had.
+#
+# A failed RELOAD is different and is ignored. waybar may not be running, there
+# may be no D-Bus session, this may be running from install.sh before there is
+# a compositor at all. The files are on disk either way and the next start picks
+# them up.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+
+reload=1
+while [[ ${1:-} == -* ]]; do
+  case "$1" in
+    --no-reload) reload=; shift ;;
+    -h|--help)
+      echo "usage: omakeb-theme-set [--no-reload] [theme]"
+      echo
+      echo "Themes:"; theme_names | sed 's/^/  /'
+      exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+name=${1:-}
+if [[ -z $name ]]; then
+  name=$(theme_current)
+  [[ -n $name ]] || name=$OMAKEB_THEME_DEFAULT
+fi
+
+theme_name_ok "$name" ||
+  die "not a usable theme name: $name
+Theme names are lowercase, and start with a letter, digit or underscore."
+
+dir=$(theme_dir "$name") || die "no such theme: $name
+Installed themes:
+$(theme_names | sed 's/^/  /')
+Add one with:  omakeb-theme-install <git-url>"
+
+# Serialise. Two theme switches racing each other (the menu and a keybinding,
+# or an update running alongside a manual switch) would interleave their writes
+# into ~/.config and leave a desktop that matches neither.
+state_init
+lock="$OMAKEB_STATE/theme.lock"
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$lock"
+  flock 9 || die "another theme change is in progress"
+fi
+
+# ------------------------------------------------------------------------------
+# Render
+# ------------------------------------------------------------------------------
+
+staging="$OMAKEB_STATE/current/next-theme"
+current="$OMAKEB_STATE/current/theme"
+
+rm -rf "$staging"
+mkdir -p "$staging"
+
+log_step "rendering $name"
+if ! theme_render "$dir" "$staging"; then
+  die "theme $name did not render; nothing has been changed.
+The partial output is in $staging for inspection."
+fi
+
+# Promote. Not a true atomic rename — a directory cannot be renamed over a
+# populated one — but nothing reads current/theme except the copy step below, so
+# the window is not observable. What the staging dance actually buys is the
+# guarantee above: a failed render never reaches ~/.config.
+rm -rf "$current"
+mkdir -p "$(dirname "$current")"
+mv "$staging" "$current"
+
+# ------------------------------------------------------------------------------
+# Install into ~/.config
+# ------------------------------------------------------------------------------
+#
+# Rendered name -> destination. The names differ because each app named its own
+# config file and none of them agreed.
+install_rendered() {
+  local src=$1; shift
+  local dest
+  [[ -f "$current/$src" ]] || { log_warn "not rendered: $src"; return 0; }
+  for dest in "$@"; do
+    write_file "$dest" 0644 < "$current/$src"
+  done
+}
+
+log_step "applying $name"
+install_rendered waybar.css           "$config_home/waybar/style.css"
+install_rendered mako.ini             "$config_home/mako/config"
+install_rendered fuzzel.ini           "$config_home/fuzzel/fuzzel.ini"
+install_rendered kitty.conf           "$config_home/kitty/kitty.conf"
+install_rendered hyprland-colors.conf "$config_home/hypr/colors.conf"
+install_rendered hyprlock.conf        "$config_home/hypr/hyprlock.conf"
+install_rendered btop.theme           "$config_home/btop/themes/omakeb.theme"
+install_rendered starship.toml        "$config_home/starship.toml"
+install_rendered gtk.css              "$config_home/gtk-3.0/gtk.css" \
+                                      "$config_home/gtk-4.0/gtk.css"
+
+# btop reads its theme by name from btop.conf, so writing the theme file is only
+# half of it. Touch nothing else in that file — btop rewrites it wholesale on
+# exit and it is full of the user's own preferences.
+btop_conf="$config_home/btop/btop.conf"
+if [[ -f $btop_conf ]]; then
+  if grep -q '^color_theme' "$btop_conf"; then
+    if ! grep -q '^color_theme = "omakeb"' "$btop_conf"; then
+      sed -i 's|^color_theme.*|color_theme = "omakeb"|' "$btop_conf"
+      log_ok "pointed btop at the omakeb theme"
+    fi
+  else
+    printf 'color_theme = "omakeb"\n' >> "$btop_conf"
+    log_ok "pointed btop at the omakeb theme"
+  fi
+else
+  write_file "$btop_conf" 0644 <<'BTOPCONF'
+# Seeded by omakeb so the theme has somewhere to be named. btop rewrites this
+# file with its full option set the first time it exits; everything it adds is
+# yours.
+color_theme = "omakeb"
+theme_background = False
+BTOPCONF
+fi
+
+state_set theme "$name"
+printf '%s\n' "$name" > "$OMAKEB_STATE/current/theme.name"
+
+# ------------------------------------------------------------------------------
+# Background
+# ------------------------------------------------------------------------------
+# Shipped themes carry no images (we do not
+# redistribute artwork of unknown provenance), so this only fires for a theme
+# the user imported. With nothing preloaded hyprpaper paints nothing and
+# misc:background_color from the rendered colours is the desktop.
+background=
+if [[ -d "$dir/backgrounds" ]]; then
+  for f in "$dir/backgrounds"/*; do
+    [[ -f $f ]] || continue
+    background=$f
+    break
+  done
+fi
+if [[ -n $background ]]; then
+  ln -sfn "$background" "$OMAKEB_STATE/current/background"
+  if [[ -n $reload ]] && command -v hyprctl >/dev/null 2>&1; then
+    hyprctl hyprpaper preload "$background" >/dev/null 2>&1 || true
+    hyprctl hyprpaper wallpaper ",$background" >/dev/null 2>&1 || true
+  fi
+else
+  rm -f "$OMAKEB_STATE/current/background"
+fi
+
+# ------------------------------------------------------------------------------
+# Reload
+# ------------------------------------------------------------------------------
+
+if [[ -z $reload ]]; then
+  log_done "theme set to $name (no reload requested)."
+  exit 0
+fi
+
+log_step "reloading"
+
+# Hyprland re-parses the whole config tree, which is what picks up colors.conf.
+if command -v hyprctl >/dev/null 2>&1 && [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then
+  hyprctl reload >/dev/null 2>&1 && log_ok "hyprland" || log_skip "hyprland did not reload"
+else
+  log_skip "hyprland is not running"
+fi
+
+# waybar: SIGUSR2 makes it re-read config and stylesheet without dropping the
+# bar. On Debian systemd owns waybar (lib/units.sh), and its unit's ExecReload
+# sends exactly that signal — so go through systemd where it is managing the
+# process, and signal the binary only on a session started bare from a TTY.
+# Signalling a systemd-managed waybar directly would work, but the unit is the
+# honest mechanism and keeps the two paths from diverging.
+if unit_managed waybar.service; then
+  systemctl --user reload waybar.service >/dev/null 2>&1 && log_ok "waybar (unit reload)" ||
+    log_skip "waybar unit would not reload"
+elif pgrep -x waybar >/dev/null 2>&1; then
+  pkill -SIGUSR2 -x waybar && log_ok "waybar (SIGUSR2)" || log_skip "waybar did not reload"
+else
+  log_skip "waybar is not running"
+fi
+
+if command -v makoctl >/dev/null 2>&1 && makoctl reload >/dev/null 2>&1; then
+  log_ok "mako"
+  # `makoctl reload` re-reads the config, which resets the active mode. Put
+  # do-not-disturb back if the toggle says it should be on, or C3's toggle
+  # silently turns itself off on every theme change.
+  if omakeb-toggle-enabled dnd 2>/dev/null; then
+    makoctl mode -s do-not-disturb >/dev/null 2>&1 || true
+  fi
+else
+  log_skip "mako is not running"
+fi
+
+# kitty re-reads kitty.conf on SIGUSR1 and repaints every window in place.
+if pgrep -x kitty >/dev/null 2>&1; then
+  pkill -SIGUSR1 -x kitty && log_ok "kitty" || log_skip "kitty did not reload"
+else
+  log_skip "kitty is not running"
+fi
+
+# GTK apps take the light/dark preference and the icon theme from gsettings,
+# not from our gtk.css. This is the same thing upstream's theme-set-gnome does.
+if command -v gsettings >/dev/null 2>&1 && [[ -n ${DBUS_SESSION_BUS_ADDRESS:-} ]]; then
+  palette=$(theme_resolve "$dir" 2>/dev/null || true)
+  value_of() { printf '%s\n' "$palette" | awk -F'\t' -v k="$1" '$1==k{print $2; exit}'; }
+  scheme=$(value_of omakeb_color_scheme)
+  icons=$(value_of omakeb_icon_theme)
+  gtk_theme=$(value_of omakeb_gtk_theme)
+  iface=org.gnome.desktop.interface
+  [[ -n $scheme ]]    && gsettings set $iface color-scheme "$scheme" 2>/dev/null || true
+  [[ -n $icons ]]     && gsettings set $iface icon-theme "$icons" 2>/dev/null || true
+  [[ -n $gtk_theme ]] && gsettings set $iface gtk-theme "$gtk_theme" 2>/dev/null || true
+  log_ok "gtk (${scheme:-?}, icons ${icons:-?})"
+else
+  log_skip "no gsettings or no session bus; gtk preferences unchanged"
+fi
+
+# btop, fuzzel and hyprlock all read their config at launch. Nothing to reload,
+# and nothing to signal — btop in particular does not handle SIGUSR2, so sending
+# one would kill the user's running btop rather than retint it.
+log_skip "btop, fuzzel and hyprlock pick the theme up at next launch"
+
+notify-send -a omakeb -i preferences-desktop-theme \
+  -h string:x-canonical-private-synchronous:omakeb-theme \
+  "Theme" "$name" 2>/dev/null || true
+
+log_done "theme set to $name."

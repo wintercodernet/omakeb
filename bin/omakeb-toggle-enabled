@@ -1,0 +1,18 @@
+#!/bin/bash
+
+# omakeb:summary=Exit 0 if the named toggle is currently on.
+# omakeb:args=<name>
+
+# C3: a toggle is on when $OMAKEB_STATE/toggles/<name> exists. The file is
+# always empty, so `ls $OMAKEB_STATE/toggles` is a readable list of what is on.
+# Menu rows use this in their `checked` / `when` conditions, and the login
+# autostart uses it to re-apply toggles that do not survive a compositor start.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+name=${1:-}
+[[ -n $name ]] || { echo "usage: omakeb-toggle-enabled <name>" >&2; exit 2; }
+
+[[ -e "$OMAKEB_STATE/toggles/$name" ]]

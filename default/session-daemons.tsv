@@ -1,0 +1,49 @@
+# omakeb — the session daemons, and who is expected to start them.
+#
+# ONE list, read at session start by bin/omakeb-session-daemons and checked by
+# test/lint-autostart.py. Everything about these five that used to be spread
+# across autostart.conf, lib/units.sh and two toggle scripts is derived from
+# here.
+#
+# WHY THESE FIVE ARE SPECIAL
+#
+# Debian ships a systemd user unit for each and enables it at package install
+# time (dh_installsystemduser drops a symlink into
+# /etc/systemd/user/graphical-session.target.wants/). A session launched through
+# uwsm reaches graphical-session.target, so systemd starts all five, and adding
+# an `exec-once` line for one starts a SECOND copy — the "two stacked waybars"
+# bug. Upstream Omarchy does start them from exec-once and is right to: nothing
+# enables them on Arch. This is a genuine Debian difference.
+#
+# But install/80-services.sh has a documented fallback: with no uwsm, greetd
+# launches Hyprland directly. That session never reaches
+# graphical-session.target, so systemd starts NONE of the five — and for a long
+# time nothing else did either, because autostart.conf omitted them on the
+# strength of the uwsm path alone. A fallback session came up with no bar, no
+# notifications, no wallpaper daemon, no night light and, worst of the five, no
+# hypridle and therefore no automatic lock.
+#
+# So neither "systemd owns them" nor "we own them" is true of the machine. It is
+# true of the SESSION, and only at run time. omakeb-session-daemons asks rather
+# than assumes: it gives the units a moment to come up, then starts whatever is
+# still missing. Both paths land in the same place.
+#
+# COLUMNS
+#
+#   name        what to call it in a message
+#   unit        the systemd user unit, when the session is systemd-managed
+#   binary      what to run when it is not. NB: the Debian PACKAGE for mako is
+#               mako-notifier (see packages/desktop.list); the binary is mako.
+#   off-toggle  the toggle whose presence means "do not run this one", or `-`.
+#               Toggle names are chosen so ABSENT means the default (C3), so a
+#               fresh install with no state directory starts everything.
+#
+# Whitespace-separated. Adding a row here is all that is needed to bring a new
+# unit-backed daemon under the same rule.
+
+# name        unit                  binary      off-toggle
+waybar        waybar.service        waybar      bar-hidden
+mako          mako.service          mako        -
+hyprpaper     hyprpaper.service     hyprpaper   -
+hypridle      hypridle.service      hypridle    idle-inhibited
+hyprsunset    hyprsunset.service    hyprsunset  -

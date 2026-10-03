@@ -1,0 +1,82 @@
+#!/bin/bash
+
+# omakeb:summary=Take a screenshot of a region, the focused window or the screen.
+# omakeb:args=<region|window|screen> [edit]
+
+# Every shot lands in two places: the clipboard, so it can be pasted straight
+# into a chat, and $(xdg-user-dir PICTURES)/Screenshots, so it still exists
+# tomorrow.
+#
+# `window` uses the focused window's geometry rather than asking for a click —
+# the key is pressed while looking at the window you want, and an extra click
+# would be a step for nothing. With no window focused it degrades to a region
+# selection instead of failing.
+#
+# The optional `edit` argument opens the shot in swappy first; it is not bound
+# by default, but it is there for a user binding in ~/.config/omakeb.
+
+set -euo pipefail
+
+mode=${1:-region}
+edit=${2:-}
+
+directory=$(xdg-user-dir PICTURES 2>/dev/null || true)
+[[ -n $directory ]] || directory=$HOME/Pictures
+directory=$directory/Screenshots
+mkdir -p "$directory"
+file=$directory/screenshot-$(date +%Y%m%d-%H%M%S).png
+
+notify() { # <summary> <body> [icon]
+  notify-send -a omakeb -i "${3:-camera-photo}" \
+    -h string:x-canonical-private-synchronous:omakeb-screenshot \
+    "$1" "$2"
+}
+
+select_region() {
+  # slurp exits non-zero when the selection is cancelled with escape.
+  slurp -d 2>/dev/null || true
+}
+
+grim_args=()
+case $mode in
+  region)
+    geometry=$(select_region)
+    [[ -n $geometry ]] || exit 0
+    grim_args=(-g "$geometry")
+    ;;
+  window)
+    geometry=$(hyprctl activewindow -j 2>/dev/null |
+      jq -r 'if .at then "\(.at[0]),\(.at[1]) \(.size[0])x\(.size[1])" else empty end' 2>/dev/null || true)
+    if [[ -z $geometry ]]; then
+      geometry=$(select_region)
+      [[ -n $geometry ]] || exit 0
+    fi
+    grim_args=(-g "$geometry")
+    ;;
+  screen)
+    # Only the monitor being looked at, not every output stitched together.
+    output=$(hyprctl monitors -j 2>/dev/null |
+      jq -r 'first(.[] | select(.focused).name) // empty' 2>/dev/null || true)
+    [[ -n $output ]] && grim_args=(-o "$output")
+    ;;
+  *)
+    notify-send -a omakeb -u critical "omakeb-capture-screenshot" \
+      "Usage: omakeb-capture-screenshot region|window|screen [edit]"
+    exit 2
+    ;;
+esac
+
+if [[ $edit == edit ]] && command -v swappy >/dev/null; then
+  temporary=$(mktemp -t omakeb-screenshot-XXXXXXXX.png)
+  trap 'rm -f "$temporary"' EXIT
+  grim "${grim_args[@]}" "$temporary"
+  swappy -f "$temporary" -o "$file" || true
+  # swappy only writes -o when the drawing is saved; a discarded edit is not
+  # an error, it is the user changing their mind.
+  [[ -s $file ]] || exit 0
+else
+  grim "${grim_args[@]}" "$file"
+fi
+
+wl-copy --type image/png < "$file"
+notify "Screenshot" "Copied — saved to ${file/#$HOME/~}" "$file"

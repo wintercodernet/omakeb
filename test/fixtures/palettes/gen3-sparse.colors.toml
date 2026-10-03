@@ -1,0 +1,17 @@
+# SYNTHETIC fixture, written for omakeb. Not vendored from any theme repo.
+#
+# The floor case: a generated theme that declares almost nothing. Everything
+# else has to come from the cascade or, where the cascade has nothing to work
+# from, from the built-in omakeb palette — per key, with one warning naming
+# them, because an import that resolves 12 of 30 keys should still give a
+# usable desktop rather than a refusal.
+#
+# It also pins the fuzzel trap: `lighter_background` is undeclared here, so it
+# falls back through color0 to `background`. Emitting the two as equal would
+# make the fuzzel selection bar invisible, so omakeb_surface must NOT equal
+# background in the resolved output.
+
+background = "#101014"
+foreground = "#d8d8e0"
+color1 = "#e05561"
+color4 = "#4aa5f0"

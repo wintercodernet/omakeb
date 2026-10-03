@@ -1,0 +1,292 @@
+#!/bin/bash
+
+# omakeb:summary=Open the omakeb menu.
+# omakeb:args=[route]
+
+# The menu is data. menu/menu.jsonc declares the whole tree (contract C4) and
+# this walks it with fuzzel, one level at a time. Nothing about the tree is
+# encoded here, so adding a row is a one-line edit of a data file and never a
+# code change — which is also what makes a future Quickshell renderer a drop-in
+# replacement for this script rather than a rewrite.
+#
+# `omakeb-menu <route>` jumps straight to a dotted id or one of its aliases.
+# A route naming a submenu opens that level; a route naming a leaf runs its
+# action immediately. That is what the keybindings rely on: SUPER+ESCAPE is
+# `omakeb-menu system` (a level) and SUPER+CTRL+SPACE is `omakeb-menu
+# style.theme` (an action).
+#
+# Escape backs out one level, and exits from the level the route started at.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+MENU_SOURCE="$OMAKEB_PATH/menu/menu.jsonc"
+MENU_USER="$OMAKEB_CONFIG/menu.jsonc"
+MENU_CACHE="$OMAKEB_CACHE/menu.json"
+MENU_STAMP="$OMAKEB_CACHE/menu.stamp"
+
+# Rows travel from jq to bash as one line per row, fields separated by ASCII US
+# (0x1f). Tab is not a safe separator here: menu actions are shell one-liners
+# full of quotes and pipes, and jq's @tsv would escape the backslashes in them.
+# 0x1f cannot occur in the source file.
+US=$'\x1f'
+
+# Errors have to be visible without a terminal — this runs from a keybinding
+# (contract C5).
+fail() {
+  notify-send -u critical -h string:x-canonical-private-synchronous:omakeb-menu \
+    "omakeb-menu" "$1" 2>/dev/null || true
+  echo "omakeb-menu: $1" >&2
+  exit 1
+}
+
+for cmd in jq fuzzel python3; do
+  command -v "$cmd" >/dev/null || fail "$cmd is not installed."
+done
+
+# ------------------------------------------------------------------------------
+# JSONC -> JSON
+# ------------------------------------------------------------------------------
+
+# The stripper has to be a tokenizer rather than a regex. `//` occurs inside
+# every URL in the tree and `#` occurs inside every `${#array[@]}` in a shell
+# condition; a line-oriented `s|//.*||` would silently truncate both, and the
+# result would still be valid JSON — so the damage would surface as a
+# mysteriously broken menu row rather than as a parse error.
+STRIP_PY='
+import json, sys
+
+def strip(src):
+    out, i, n = [], 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == "\"":                       # string: copy verbatim, honour escapes
+            j = i + 1
+            while j < n:
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == "\"":
+                    j += 1
+                    break
+                j += 1
+            out.append(src[i:j]); i = j; continue
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            j = src.find("\n", i); i = n if j < 0 else j; continue
+        if c == "/" and i + 1 < n and src[i + 1] == "*":
+            j = src.find("*/", i + 2); i = n if j < 0 else j + 2; continue
+        if c == "#":
+            j = src.find("\n", i); i = n if j < 0 else j; continue
+        if c in "}]":                       # drop a dangling comma before it
+            k = len(out) - 1
+            while k >= 0 and out[k].strip() == "":
+                k -= 1
+            if k >= 0 and out[k] == ",":
+                out[k] = ""
+        out.append(c); i += 1
+    return "".join(out)
+
+def load(path):
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    try:
+        return json.loads(strip(text))
+    except ValueError as exc:
+        sys.exit("%s: %s" % (path, exc))
+
+merged = load(sys.argv[1])
+for extra in sys.argv[2:]:
+    # Field-level merge, so reusing an id in the user file overrides only the
+    # fields it names. dict preserves insertion order, so our rows keep their
+    # declared order and new user rows are appended.
+    for key, row in load(extra).items():
+        if isinstance(merged.get(key), dict) and isinstance(row, dict):
+            merged[key] = {**merged[key], **row}
+        else:
+            merged[key] = row
+
+json.dump(merged, sys.stdout)
+'
+
+mtime() {
+  [[ -e $1 ]] || { echo -; return 0; }
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"
+}
+
+# The stamp records the mtime of every source, so deleting the user file
+# invalidates the cache too. Comparing the cache's own mtime would not.
+menu_json() {
+  [[ -f $MENU_SOURCE ]] || fail "menu definition missing: $MENU_SOURCE"
+
+  local want
+  want="$(mtime "$MENU_SOURCE"):$(mtime "$MENU_USER")"
+
+  if [[ -f $MENU_CACHE && -f $MENU_STAMP && $(cat "$MENU_STAMP") == "$want" ]]; then
+    cat "$MENU_CACHE"
+    return 0
+  fi
+
+  local sources=("$MENU_SOURCE")
+  [[ -f $MENU_USER ]] && sources+=("$MENU_USER")
+
+  mkdir -p "$OMAKEB_CACHE"
+  python3 -c "$STRIP_PY" "${sources[@]}" > "$MENU_CACHE.$$" ||
+    { rm -f "$MENU_CACHE.$$"; fail "menu definition does not parse; run omakeb-menu from a terminal to see where."; }
+  mv "$MENU_CACHE.$$" "$MENU_CACHE"
+  printf '%s\n' "$want" > "$MENU_STAMP"
+  cat "$MENU_CACHE"
+}
+
+MENU=$(menu_json)
+
+# ------------------------------------------------------------------------------
+# Tree queries
+# ------------------------------------------------------------------------------
+
+# Resolve a user-supplied route to a dotted id, following aliases.
+resolve_route() {
+  jq -r --arg r "$1" '
+    . as $m
+    | if has($r) then $r
+      else ([ keys_unsorted[] | select(($m[.].aliases // []) | index($r)) ] | first // "")
+      end
+  ' <<<"$MENU"
+}
+
+field_of() { jq -r --arg id "$1" --arg f "$2" '.[$id][$f] // ""' <<<"$MENU"; }
+label_of() { jq -r --arg id "$1" '.[$id].label // $id' <<<"$MENU"; }
+
+# Rows directly under $1 ("" for the root), in declaration order. One line per
+# row: id, kind, icon, label, action, when, checked, disabled — US separated.
+rows_under() {
+  jq -r --arg p "$1" '
+    . as $m
+    | (keys_unsorted) as $ids
+    | $ids
+    | map(select(
+        if $p == "" then (contains(".") | not)
+        else startswith($p + ".") and ((.[($p | length) + 1:]) | contains(".") | not)
+        end))
+    | map(. as $id | $m[$id] as $r
+        | [ $id,
+            (if ($r.action // "") != "" then "action"
+             elif ([$ids[] | select(startswith($id + "."))] | length) > 0 then "menu"
+             else "empty" end),
+            ($r.icon // ""), ($r.label // $id), ($r.action // ""),
+            ($r.when // ""), ($r.checked // ""), ($r.disabled // "") ]
+        | join("\u001f"))
+    | .[]
+  ' <<<"$MENU"
+}
+
+# Conditions are the menu author's shell, not ours: run them with our strict
+# options off, so an unset variable in a condition means "false" rather than a
+# crash, and in a subshell so `shopt` and friends cannot leak into the walker.
+cond() {
+  [[ -n $1 ]] || return 1
+  ( set +eu +o pipefail; eval "$1" ) >/dev/null 2>&1
+}
+
+# ------------------------------------------------------------------------------
+# Walk
+# ------------------------------------------------------------------------------
+
+# Replace ourselves: fuzzel has already exited, and the action owns whatever
+# window it opens.
+run_action() { exec bash -c "$1"; }
+
+# Renders one level and sets picked_kind / picked_id / picked_action.
+# Returns 1 when the user pressed Escape.
+render_level() {
+  local level=$1
+  local -a ids=() kinds=() actions=() display=()
+  local id kind icon label action when checked disabled line idx prompt
+
+  while IFS=$US read -r id kind icon label action when checked disabled; do
+    [[ -n $id ]] || continue
+    [[ $kind == empty ]] && continue
+    if [[ -n $when ]] && ! cond "$when"; then continue; fi
+
+    line="$icon  $label"
+    if cond "$disabled"; then
+      kind=disabled
+      line+="  ✓"
+    elif cond "$checked"; then
+      line+="  ✓"
+    fi
+
+    ids+=("$id"); kinds+=("$kind"); actions+=("$action"); display+=("$line")
+  done < <(rows_under "$level")
+
+  (( ${#ids[@]} )) || { picked_kind=none; return 0; }
+
+  prompt="omakeb  "
+  [[ -n $level ]] && prompt="$(label_of "$level")  "
+
+  # --index returns the row number rather than the row text, so a label never
+  # has to be parsed back into an id and duplicate labels are harmless. fuzzel
+  # prints -1 when the typed text matched no row.
+  idx=$(printf '%s\n' "${display[@]}" |
+          fuzzel --dmenu --index --prompt="$prompt" --width=48) || idx=-1
+  [[ -n $idx ]] || idx=-1
+  (( idx >= 0 && idx < ${#ids[@]} )) || return 1
+
+  picked_kind=${kinds[idx]}
+  picked_id=${ids[idx]}
+  picked_action=${actions[idx]}
+  return 0
+}
+
+# Escape backs out one level. The stack only ever holds levels this invocation
+# walked into, so escaping at the level a route opened exits rather than
+# wandering up into a menu the user never asked for.
+stack=()
+pop_level() {
+  local top=$(( ${#stack[@]} - 1 ))
+  (( top >= 0 )) || return 1
+  level=${stack[$top]}
+  unset "stack[$top]"
+  return 0
+}
+
+route=${1:-}
+level=""
+
+if [[ -n $route ]]; then
+  level=$(resolve_route "$route")
+  [[ -n $level ]] || fail "no such menu route: $route"
+
+  # A route straight to a leaf runs it. This is what the theme and background
+  # keybindings expect.
+  action=$(field_of "$level" action)
+  [[ -n $action ]] && run_action "$action"
+fi
+
+while :; do
+  picked_kind=; picked_id=; picked_action=
+
+  if ! render_level "$level"; then
+    pop_level || exit 0
+    continue
+  fi
+
+  case $picked_kind in
+    none)
+      notify-send -h string:x-canonical-private-synchronous:omakeb-menu \
+        "omakeb" "Nothing available here." 2>/dev/null || true
+      pop_level || exit 0
+      ;;
+    disabled)
+      notify-send -h string:x-canonical-private-synchronous:omakeb-menu \
+        "omakeb" "$(label_of "$picked_id") is unavailable." 2>/dev/null || true
+      ;;
+    action)
+      run_action "$picked_action"
+      ;;
+    menu)
+      stack+=("$level")
+      level=$picked_id
+      ;;
+  esac
+done

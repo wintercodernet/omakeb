@@ -1,0 +1,49 @@
+#!/bin/bash
+
+# omakeb:summary=Open the editor in a terminal window.
+# omakeb:args=[file...]
+
+# EDITOR_CMD is a console editor (nvim by default, D7), so it needs a terminal
+# to live in. Both halves come from ~/.config/omakeb/apps.conf at run time (C2).
+
+set -euo pipefail
+
+notify() {
+  command -v notify-send >/dev/null &&
+    notify-send -a omakeb \
+      -h string:x-canonical-private-synchronous:omakeb-launch "$@" || true
+}
+
+load_apps_conf() {
+  local conf="${OMAKEB_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/omakeb}/apps.conf"
+  [[ -r $conf ]] || return 0
+  set +e
+  # shellcheck source=/dev/null
+  source "$conf"
+  set -e
+}
+
+load_apps_conf
+TERMINAL=${TERMINAL:-kitty}
+EDITOR_CMD=${EDITOR_CMD:-nvim}
+
+# EDITOR_CMD is a command line, not a bare name ("nvim -u NONE" must work).
+read -r -a editor_argv <<<"$EDITOR_CMD"
+
+if ((${#editor_argv[@]} == 0)); then
+  notify "omakeb" "EDITOR_CMD is empty in apps.conf."
+  exit 1
+fi
+if ! command -v "${editor_argv[0]}" >/dev/null; then
+  notify "omakeb" "Editor '${editor_argv[0]}' is not installed. Check apps.conf."
+  exit 1
+fi
+if ! command -v "$TERMINAL" >/dev/null; then
+  notify "omakeb" "Terminal '$TERMINAL' is not installed. Check apps.conf."
+  exit 1
+fi
+
+case "${TERMINAL##*/}" in
+  foot | footclient) exec "$TERMINAL" "${editor_argv[@]}" "$@" ;;
+  *) exec "$TERMINAL" -e "${editor_argv[@]}" "$@" ;;
+esac

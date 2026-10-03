@@ -1,0 +1,162 @@
+#!/bin/bash
+
+# omakeb:summary=Install a theme from a git URL or a local directory.
+# omakeb:args=<git-url|path> [name]
+
+# WHAT THIS DOES, PRECISELY: it imports a PALETTE. omakeb reads `colors.toml`
+# (or back-derives one from `alacritty.toml`) and renders the bar, launcher,
+# notifications, lock screen, terminal and the rest itself, from that palette.
+#
+# It is not "Omarchy theme support" and we do not describe it that way (D11).
+# A theme's visual identity beyond colour does not come across, because upstream
+# has no waybar, mako, fuzzel, hyprlock or gtk template to come across FROM —
+# its shell is Quickshell QML. The per-app files that ~60% of community themes
+# still ship are Omarchy v1 leftovers: their waybar.css files carry two colours
+# where our bar needs eight roles, and their mako.ini would replace our layout
+# and drop the [mode=do-not-disturb] section the DND toggle depends on. Every
+# ignored file is named at import time with the reason.
+#
+# WE DISTRIBUTE NOTHING. The clone goes to a temporary directory that is deleted
+# when this exits, and only the allowlisted files are kept — half the community
+# theme repos carry no licence at all, so caching or re-publishing their content
+# is not ours to do. Any LICENSE and README
+# found are copied next to the palette, unused, so the author's terms stay with
+# their work.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+usage() {
+  cat <<'USAGE'
+usage: omakeb-theme-install <git-url|path> [name]
+
+  omakeb-theme-install https://github.com/someone/omarchy-nord-theme
+  omakeb-theme-install ~/my-palette  midnight
+
+Imports the palette only. Everything else the theme ships is ignored, and
+named on stderr with the reason.
+USAGE
+}
+
+source_ref=${1:-}
+[[ $source_ref == -h || $source_ref == --help ]] && { usage; exit 0; }
+
+# With no argument, ask. The menu row is a plain `omakeb-launch-tui
+# omakeb-theme-install`, so the prompt has to work from a terminal; run without
+# one (a keybinding), fuzzel takes the input instead.
+if [[ -z $source_ref ]]; then
+  if [[ -t 0 ]]; then
+    read -rp "Theme git URL or local path: " source_ref
+  elif command -v fuzzel >/dev/null 2>&1; then
+    source_ref=$(: | fuzzel --dmenu --prompt='Theme URL  ' --width=64) || true
+  fi
+fi
+[[ -n $source_ref ]] || { usage; exit 1; }
+
+# --- name -------------------------------------------------------------------
+# Derived before anything is fetched, because the name is a path component and
+# the re-import path runs `rm -rf` on it. `..` as a theme name would take
+# $OMAKEB_CONFIG/themes with it.
+derive_name() {
+  local ref=$1 base
+  base=${ref%/}
+  base=${base%.git}
+  base=${base##*/}
+  base=${base##*:}
+  base=$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')
+  base=${base#omarchy-}
+  base=${base#omakeb-}
+  base=${base%-theme}
+  printf '%s\n' "$base"
+}
+
+name=${2:-$(derive_name "$source_ref")}
+theme_name_ok "$name" ||
+  die "cannot derive a usable theme name from '$source_ref' (got '${name}').
+Pass one explicitly:  omakeb-theme-install $source_ref <name>
+Names are lowercase and may contain letters, digits, . _ + and -."
+
+state_init
+dest="$OMAKEB_CONFIG/themes/$name"
+
+# --- fetch ------------------------------------------------------------------
+
+work=
+cleanup() { [[ -n $work && -d $work ]] && rm -rf "$work"; }
+trap cleanup EXIT
+
+if [[ -d $source_ref ]]; then
+  src=$(cd -- "$source_ref" && pwd)
+  origin="local:$src"
+  log_step "importing $name from $src"
+else
+  # Only the two transports a person actually types. Everything else — ext::,
+  # file://, --upload-pack, a leading dash that git would read as an option —
+  # is refused rather than sanitised, because git's URL surface is large and an
+  # allowlist of two is the only version of this check that stays correct.
+  case "$source_ref" in
+    https://*|git@*:*) ;;
+    -*)  die "refusing an argument that starts with '-': $source_ref" ;;
+    *)   die "only https:// and git@host:path URLs are accepted (got: $source_ref)" ;;
+  esac
+  case "$source_ref" in
+    *--upload-pack*|*ext::*|*' '*) die "refusing a URL with an unsafe component" ;;
+  esac
+  command -v git >/dev/null 2>&1 || die "git is not installed"
+
+  # Printed BEFORE the clone, not after: the user should see whose code is about
+  # to be fetched while they can still stop it.
+  log_step "importing $name"
+  log_info "source:      $source_ref"
+  log_info "This is a third-party theme. omakeb has not reviewed it, and takes"
+  log_info "only its colour palette — see the ignore list printed below."
+
+  work=$(mktemp -d "${TMPDIR:-/tmp}/omakeb-theme-import.XXXXXX")
+  src="$work/clone"
+  git clone --depth 1 --quiet -- "$source_ref" "$src" ||
+    die "could not clone $source_ref"
+  rm -rf "$src/.git"
+  origin="omarchy:$source_ref"
+
+  # Upstream's own themes/ is 64 MB for 22 themes, nearly all backgrounds. A
+  # repo an order of magnitude past that is not a palette.
+  size=$(du -sk "$src" 2>/dev/null | awk '{print $1}')
+  if [[ -n ${size:-} ]] && (( size > 51200 )); then
+    die "refusing $source_ref: the clone is $((size / 1024)) MB, over the 50 MB cap"
+  fi
+fi
+
+# --- import -----------------------------------------------------------------
+
+if [[ -d $dest ]]; then
+  log_info "replacing the existing $name"
+  rm -rf "$dest"
+fi
+
+if ! theme_import "$src" "$dest" "$origin"; then
+  rm -rf "$dest"
+  die "import failed; nothing was installed"
+fi
+
+# Prove the palette resolves before we offer to apply it. A colors.toml that
+# parses to nothing usable is better caught here, with the source URL still on
+# screen, than as a black desktop.
+if ! theme_resolve "$dest" >/dev/null; then
+  rm -rf "$dest"
+  die "the palette in $name does not resolve; nothing was installed"
+fi
+
+log_done "installed theme: $name"
+log_info "palette: $dest/colors.toml"
+log_info "apply it with:  omakeb-theme-set $name"
+
+if [[ -t 0 ]]; then
+  read -rp "Apply it now? [Y/n] " answer
+  case "${answer:-y}" in
+    [Nn]*) exit 0 ;;
+  esac
+fi
+# exec does not run an EXIT trap, so drop the clone by hand first.
+cleanup; trap - EXIT
+exec "$OMAKEB_PATH/bin/omakeb-theme-set" "$name"

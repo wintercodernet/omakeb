@@ -1,0 +1,114 @@
+#!/bin/bash
+
+# omakeb:summary=Pick an emoji, copy it, and type it into the focused window.
+
+# There is no emoji database to install. Debian ships none that is worth a
+# dependency, upstream Omarchy carries its own list file, and downloading one at
+# build time would be a tier-3 item with no security updates for the sake of a
+# text file. Instead the list is generated from python3's `unicodedata`, which is
+# stdlib — the same Unicode tables python already carries — so the picker has
+# exactly one dependency, and it is one the base install already has.
+#
+# Names come from Unicode itself, so searching works the way you would expect:
+# "grin", "rocket", "family" all match. The generated list is cached, and
+# regenerated whenever this script is newer than the cache, so editing the block
+# list below is enough to change what appears.
+#
+# Bound to SUPER+CTRL+E.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+CACHE="$OMAKEB_CACHE/emoji.txt"
+
+fail() {
+  notify-send -u critical -h string:x-canonical-private-synchronous:omakeb-emoji \
+    "Emoji" "$1" 2>/dev/null || true
+  echo "omakeb-menu-emoji: $1" >&2
+  exit 1
+}
+
+for cmd in fuzzel wl-copy python3; do
+  command -v "$cmd" >/dev/null || fail "$cmd is not installed."
+done
+
+# Unicode has no "is this an emoji" property in unicodedata, so the selection is
+# by block. These are the blocks that are wholly or mostly pictographic; a few
+# non-emoji symbols coming along (arrows, geometric shapes) is the right error to
+# make, since they are worth having in a symbol picker anyway.
+GEN_PY='
+import sys, unicodedata
+
+BLOCKS = [
+    (0x2190, 0x21FF),   # arrows
+    (0x2300, 0x23FF),   # misc technical: watch, hourglass, transport controls
+    (0x25A0, 0x25FF),   # geometric shapes
+    (0x2600, 0x27BF),   # misc symbols and dingbats
+    (0x2B00, 0x2BFF),   # misc symbols and arrows: star, large squares
+    (0x1F000, 0x1F02F), # mahjong tiles
+    (0x1F0A0, 0x1F0FF), # playing cards
+    (0x1F300, 0x1F5FF), # misc symbols and pictographs
+    (0x1F600, 0x1F64F), # emoticons
+    (0x1F650, 0x1F67F), # ornamental dingbats
+    (0x1F680, 0x1F6FF), # transport and map
+    (0x1F780, 0x1F7FF), # geometric shapes extended
+    (0x1F900, 0x1F9FF), # supplemental symbols and pictographs
+    (0x1FA70, 0x1FAFF), # symbols and pictographs extended-A
+]
+SINGLES = [0x00A9, 0x00AE, 0x203C, 0x2049, 0x2122, 0x2139, 0x3030, 0x303D, 0x3297, 0x3299]
+
+# Combining marks, format controls and unassigned codepoints render as nothing
+# or corrupt the row they land in.
+SKIP_CATEGORIES = {"Cn", "Cc", "Cf", "Mn", "Me", "Zs"}
+# Never useful on their own: a flag needs a pair, a tag needs a base.
+SKIP_PREFIXES = ("REGIONAL INDICATOR", "VARIATION SELECTOR", "TAG ")
+
+def emit(cp, seen, out):
+    if cp in seen:
+        return
+    seen.add(cp)
+    ch = chr(cp)
+    name = unicodedata.name(ch, "")
+    if not name or name.startswith(SKIP_PREFIXES):
+        return
+    if unicodedata.category(ch) in SKIP_CATEGORIES:
+        return
+    out.append("%s  %s" % (ch, name.lower()))
+
+seen, out = set(), []
+for lo, hi in BLOCKS:
+    for cp in range(lo, hi + 1):
+        emit(cp, seen, out)
+for cp in SINGLES:
+    emit(cp, seen, out)
+
+sys.stdout.write("\n".join(out) + "\n")
+'
+
+if [[ ! -s $CACHE || $0 -nt $CACHE ]]; then
+  mkdir -p "$OMAKEB_CACHE"
+  python3 -c "$GEN_PY" > "$CACHE.$$" || { rm -f "$CACHE.$$"; fail "could not build the emoji list."; }
+  mv "$CACHE.$$" "$CACHE"
+fi
+
+# Escape and an empty pick are both "changed my mind", not failures.
+picked=$(fuzzel --dmenu --prompt='Emoji  ' --width=44 < "$CACHE") || exit 0
+[[ -n $picked ]] || exit 0
+
+# Rows are "<char><two spaces><name>", and no emoji contains a space.
+emoji=${picked%% *}
+[[ -n $emoji ]] || exit 0
+
+printf '%s' "$emoji" | wl-copy
+
+# Typing it is the point — the clipboard is the fallback, not the feature. wtype
+# is a plain trixie package but it needs the compositor's virtual-keyboard
+# protocol, so treat a failure as "it is on the clipboard, paste it yourself"
+# rather than as an error.
+if command -v wtype >/dev/null && wtype "$emoji" 2>/dev/null; then
+  exit 0
+fi
+
+notify-send -h string:x-canonical-private-synchronous:omakeb-emoji \
+  "Emoji" "$emoji copied to the clipboard" 2>/dev/null || true

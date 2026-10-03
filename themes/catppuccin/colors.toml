@@ -1,0 +1,34 @@
+# omakeb theme — Catppuccin (Mocha).
+# See themes/tokyo-night/colors.toml for what each key means.
+
+mode = "dark"
+
+accent = "#89b4fa"
+selection = "#45475a"
+muted = "#6c7086"
+
+background = "#1e1e2e"
+dark_background = "#181825"
+darker_background = "#11111b"
+lighter_background = "#313244"
+
+foreground = "#cdd6f4"
+dark_foreground = "#6c7086"
+light_foreground = "#bac2de"
+bright_foreground = "#f5e0dc"
+
+red = "#f38ba8"
+yellow = "#f9e2af"
+orange = "#fab387"
+green = "#a6e3a1"
+cyan = "#94e2d5"
+blue = "#89b4fa"
+magenta = "#cba6f7"
+brown = "#b4886b"
+
+bright_red = "#f5a3bc"
+bright_yellow = "#fbe9c4"
+bright_green = "#b8e9b4"
+bright_cyan = "#a9e9df"
+bright_blue = "#a1c4fb"
+bright_magenta = "#d7bcf9"

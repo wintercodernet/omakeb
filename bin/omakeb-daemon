@@ -1,0 +1,127 @@
+#!/bin/bash
+
+# omakeb:summary=Start a session daemon, but only if that exact command is not already running.
+# omakeb:args=<command> [args...]
+
+# Session startup has to be idempotent. The daemons in autostart.conf are the
+# ones Debian ships no systemd user unit for, so nothing but this reaps an orphan
+# when Hyprland restarts and nothing else stops a second copy being launched. The
+# quiet symptom is two cliphist watchers storing every clipboard entry twice.
+#
+# The five daemons that DO have a packaged unit are never started from
+# autostart.conf: starting waybar from exec-once as well as from its unit was the
+# original "two stacked bars" bug. They are started through this script by
+# bin/omakeb-session-daemons instead, and only on a session where systemd did not
+# start them — which it works out at run time rather than guessing. See
+# default/session-daemons.tsv. (Bars can also stack for an unrelated reason — a
+# display hotplug waybar mis-tracks — which bin/omakeb-monitor-watch repairs.)
+#
+# HOW A DAEMON IS RECOGNISED AS ALREADY RUNNING
+#
+# On the program, resolved to an absolute path, plus its arguments compared one
+# by one. Both halves matter:
+#
+#   * The arguments have to be exact, because the two cliphist watchers differ
+#     in nothing else:
+#         wl-paste --type text  --watch cliphist store
+#         wl-paste --type image --watch cliphist store
+#     Matching on the process name alone would treat those as one daemon and
+#     silently start only the first, leaving image clipboard history broken.
+#
+#   * The program has to be resolved rather than compared as text. This used to
+#     be a literal `pgrep -f -x "$*"` against the command line as written, which
+#     cannot match a SHELL SCRIPT: the kernel hands a script's argv to its
+#     interpreter, so what is actually on the process table is
+#         /bin/bash /home/you/omakeb/bin/omakeb-monitor-watch
+#     and never the bare name this was asked to guard. Every entry here happened
+#     to be a compiled binary invoked exactly as written, so nothing noticed —
+#     but a script daemon would quietly stack another copy on every login, and
+#     test/lint-autostart.py would pass it, because the guard was present and
+#     simply not working.
+#
+# So a running process matches when either:
+#     its /proc/<pid>/exe is our target        — a compiled binary, however the
+#                                                command line happened to spell it
+#     or its argv[1] resolves to our target    — a script, with the interpreter
+#                                                occupying argv[0]
+# and the arguments after that are identical.
+
+set -euo pipefail
+
+if [[ $# -eq 0 ]]; then
+  echo "usage: omakeb-daemon <command> [args...]" >&2
+  exit 2
+fi
+
+# Resolve first: the target path is what every comparison below is made against.
+# A missing optional daemon must not abort the rest of the session, so report and
+# succeed. Nothing is watching stdout here, hence notify-send.
+if ! target=$(command -v -- "$1" 2>/dev/null) || [[ -z $target ]]; then
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a omakeb -u critical "omakeb" "Session daemon not found: $1" || true
+  fi
+  exit 0
+fi
+shift
+args=("$@")
+
+# Read a NUL-separated /proc/<pid>/cmdline into the argv array. `read -d ''`
+# rather than `mapfile -d ''` so this does not depend on bash 4.4.
+read_cmdline() {
+  local file=$1 arg
+  argv=()
+  [[ -r $file ]] || return 1
+  while IFS= read -r -d '' arg; do
+    argv+=("$arg")
+  done < "$file"
+  ((${#argv[@]} > 0))
+}
+
+same_args() {
+  local -a rest=("$@")
+  ((${#rest[@]} == ${#args[@]})) || return 1
+  local i
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    [[ ${rest[i]} == "${args[i]}" ]] || return 1
+  done
+  return 0
+}
+
+# `-ef` is true when two paths reach the same device and inode, following
+# symlinks on the way. That is what we want anyway — /usr/bin/foo and a symlink
+# to it are the same daemon — and it forks nothing, which matters because this
+# runs once per autostart entry over every process on the machine.
+is_running() {
+  local dir pid script
+  for dir in /proc/[0-9]*; do
+    pid=${dir#/proc/}
+    [[ $pid == "$$" ]] && continue
+
+    read_cmdline "$dir/cmdline" || continue
+
+    # A compiled binary: /proc/<pid>/exe is the program itself, so this holds
+    # whether the command line said `wl-paste` or `/usr/bin/wl-paste`. Another
+    # user's exe is unreadable and simply does not match, which is correct.
+    if [[ $dir/exe -ef $target ]]; then
+      same_args "${argv[@]:1}" && return 0
+      continue
+    fi
+
+    # A script: the interpreter is argv[0] and the script is argv[1]. A relative
+    # path is resolved through that process's own cwd rather than ours.
+    script=${argv[1]:-}
+    if [[ -n $script ]]; then
+      [[ $script == /* ]] || script=$dir/cwd/$script
+      [[ $script -ef $target ]] && same_args "${argv[@]:2}" && return 0
+    fi
+  done
+  return 1
+}
+
+# Already running: nothing to do. This is the whole point — re-running autostart,
+# or a compositor restart, must not produce a second instance.
+is_running && exit 0
+
+# setsid -f detaches, so the daemon is not killed when Hyprland reaps the
+# exec-once shell.
+setsid -f "$target" "${args[@]}" >/dev/null 2>&1

@@ -1,0 +1,94 @@
+#!/bin/bash
+
+# omakeb:summary=Open a URL as a standalone application window.
+# omakeb:args=<url> [class]
+
+# The recipe advertised in config/bindings.conf for turning a site into a
+# keybinding:
+#
+#   bindd = SUPER SHIFT, Y, YouTube, exec, omakeb-launch-webapp https://youtube.com
+#
+# The optional second argument sets the window class, so a webapp can get its
+# own Hyprland window rules (size, workspace, float). It defaults to
+# "omakeb-webapp-<host>", which is stable per site.
+#
+# Chromium's --app gives a real chromeless window. Firefox removed --app years
+# ago and has no equivalent: --kiosk is fullscreen-with-no-exit, which is a
+# worse default than an ordinary window, so Firefox users get --new-window and
+# a browser frame. Set BROWSER=chromium in apps.conf for the real thing.
+
+set -euo pipefail
+
+notify() {
+  command -v notify-send >/dev/null &&
+    notify-send -a omakeb \
+      -h string:x-canonical-private-synchronous:omakeb-launch "$@" || true
+}
+
+load_apps_conf() {
+  local conf="${OMAKEB_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/omakeb}/apps.conf"
+  [[ -r $conf ]] || return 0
+  set +e
+  # shellcheck source=/dev/null
+  source "$conf"
+  set -e
+}
+
+detect_browser() {
+  local candidate
+  for candidate in chromium chromium-browser firefox firefox-esr xdg-open; do
+    if command -v "$candidate" >/dev/null; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if (($# == 0)); then
+  notify "omakeb" "omakeb-launch-webapp needs a URL."
+  exit 2
+fi
+
+url=$1
+shift
+
+load_apps_conf
+
+browser_argv=()
+if [[ -n ${BROWSER:-} ]]; then
+  read -r -a browser_argv <<<"$BROWSER"
+fi
+if ((${#browser_argv[@]} == 0)) || ! command -v "${browser_argv[0]}" >/dev/null; then
+  browser=$(detect_browser) || {
+    notify "omakeb" "No browser found. Install chromium, or set BROWSER in apps.conf."
+    exit 1
+  }
+  browser_argv=("$browser")
+fi
+
+# Derive a class from the host: strip the scheme, then everything from the first
+# slash, then a leading "www.", then reduce to characters a window rule regex
+# can hold without escaping.
+if (($# > 0)); then
+  class=$1
+else
+  host=${url#*://}
+  host=${host%%/*}
+  host=${host#www.}
+  host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-')
+  host=${host%-}
+  class="omakeb-webapp-${host:-site}"
+fi
+
+case "${browser_argv[0]##*/}" in
+  chromium* | chrome* | google-chrome* | brave* | vivaldi* | *edge*)
+    exec "${browser_argv[@]}" "--app=$url" "--class=$class"
+    ;;
+  firefox* | librewolf* | zen*)
+    exec "${browser_argv[@]}" --new-window "$url"
+    ;;
+  *)
+    exec "${browser_argv[@]}" "$url"
+    ;;
+esac

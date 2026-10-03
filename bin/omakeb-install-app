@@ -1,0 +1,240 @@
+#!/bin/bash
+
+# omakeb:summary=Install or remove optional software from apps/.
+# omakeb:args=[list|install [app]|remove [app]|upgrade [app]] (no app name opens a picker; upgrade with none checks every tier-3 app)
+
+# Tier 2 is upstream apt repos; tier 3 is a download (D4, D10). Each app is one
+# file in apps/ declaring app_name/app_tier/app_archs and install/remove/installed.
+#
+# Availability is per-app AND per-architecture. A third-party repo genuinely may
+# not exist for this machine, and unlike the Debian archive there is no way to
+# ask apt before adding the source — so each app declares what upstream actually
+# ships and we refuse cleanly rather than leaving a broken source behind.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+APPS_DIR="${OMAKEB_APPS_DIR:-$OMAKEB_PATH/apps}"
+
+# Installing needs sudo, and sudo needs somewhere to ask. Launched from the menu
+# there is no terminal at all, so lib/sudo.sh would (correctly) refuse. Re-exec
+# into a terminal instead: the picker still runs as a Wayland client from the
+# menu, and the install itself gets a window that can prompt and show apt's
+# output — which the user wants to see anyway.
+#
+# Guard on "no tty AND no cached sudo credential", so a run from a terminal, or
+# one where sudo is already primed, proceeds in place.
+reexec_in_terminal_if_needed() {
+  [[ -t 0 ]] && return 0
+  sudo -n true 2>/dev/null && return 0
+  [[ -n ${OMAKEB_IN_TERMINAL:-} ]] && return 0   # already re-executed; do not loop
+  command -v omakeb-launch-tui >/dev/null 2>&1 || return 0
+  exec omakeb-launch-tui bash -c \
+    "OMAKEB_IN_TERMINAL=1 omakeb-install-app $(printf '%q ' "$@"); \
+     printf '\n'; read -rsn1 -p 'Press any key to close.'"
+}
+
+app_ids() {
+  local f
+  for f in "$APPS_DIR"/*.sh; do
+    [[ -f $f ]] || continue
+    basename "$f" .sh
+  done
+}
+
+# Each app is sourced in a subshell by the callers below, so declarations from
+# one file can never leak into another. The sourcing itself lives in lib/apps.sh
+# (app_load) because omakeb-update's staleness report needs exactly the same.
+load_app() {
+  app_load "$1" || die "no such app: $1"
+}
+
+status_of() {  # prints: installed | available | unavailable
+  local id=$1
+  ( load_app "$id"
+    if ! app_supports_arch; then echo unavailable
+    elif app_installed 2>/dev/null; then echo installed
+    else echo available
+    fi )
+}
+
+cmd_list() {
+  local id status
+  printf '%-14s %-8s %-12s %s\n' ID TIER STATUS NAME
+  for id in $(app_ids); do
+    status=$(status_of "$id")
+    printf '%-14s %-8s %-12s %s\n' \
+      "$id" "tier $( ( load_app "$id"; echo "$app_tier" ) )" "$status" \
+      "$( ( load_app "$id"; echo "$app_name" ) )"
+  done
+}
+
+cmd_install() {
+  local id=$1
+  load_app "$id"
+  if ! app_supports_arch; then
+    die "$app_name is not available for $(arch_dpkg).
+Upstream publishes no $(arch_dpkg) build (supported: ${app_archs}).
+This is a limitation of the vendor, not of omakeb — Flatpak has no $(arch_dpkg) build either."
+  fi
+  if app_installed 2>/dev/null; then
+    log_skip "$app_name is already installed"
+    return 0
+  fi
+  reexec_in_terminal_if_needed install "$id"
+  log_step "installing $app_name (tier $app_tier)"
+  sudo_keepalive_start
+  app_install
+  log_done "$app_name installed."
+}
+
+cmd_remove() {
+  local id=$1
+  load_app "$id"
+  if ! app_installed 2>/dev/null; then
+    log_skip "$app_name is not installed"
+    return 0
+  fi
+  reexec_in_terminal_if_needed remove "$id"
+  log_step "removing $app_name"
+  sudo_keepalive_start
+  app_remove
+  log_done "$app_name removed."
+}
+
+# upgrade <app> — tier 3 only. Tier 2 comes from an apt repository and apt
+# upgrades it with everything else; tier 3 is nobody's job but ours (D4).
+#
+# Re-runs app_install, which for every tier-3 app fetches the newest upstream
+# build and records its version: npm_tool_install installs <pkg>@latest, and
+# LocalSend's app_install asks GitHub for the latest tag and installs that .deb
+# over the old one. So "upgrade" needs no second install path per app, only a
+# check that there is something newer, which is what app_latest is for.
+cmd_upgrade() {
+  local id=$1 recorded latest
+  load_app "$id"
+  if [[ $app_tier != 3 ]]; then
+    log_skip "$app_name is tier $app_tier: apt upgrades it (omakeb-update)"
+    return 0
+  fi
+  if ! app_installed 2>/dev/null; then
+    log_skip "$app_name is not installed"
+    return 0
+  fi
+  if [[ -n ${app_self_updating:-} ]]; then
+    log_skip "$app_name updates itself; nothing for omakeb to do"
+    return 0
+  fi
+  if ! declare -F app_latest >/dev/null; then
+    log_skip "$app_name defines no way to check for a newer version"
+    return 0
+  fi
+  latest=$(app_latest) || die "could not ask upstream for the latest $app_name version (offline?)"
+  recorded=$(tier3_version_get "$id")
+  if [[ $recorded == "$latest" ]]; then
+    log_skip "$app_name $recorded is current"
+    return 0
+  fi
+  reexec_in_terminal_if_needed upgrade "$id"
+  log_step "upgrading $app_name ${recorded:-unknown} -> $latest"
+  sudo_keepalive_start
+  app_install
+  log_done "$app_name upgraded."
+}
+
+# upgrade with no app: every installed tier-3 app, each in its OWN process.
+# Not a subshell behind `||`: that would suspend errexit inside app_install,
+# so an install step that relies on it to stop would carry
+# on half-done. A separate process keeps the runner's own rules, and one app
+# that fails does not stop the others being checked.
+cmd_upgrade_all() {
+  local id failed=()
+  reexec_in_terminal_if_needed upgrade
+  for id in $(app_ids); do
+    # Tier 3 and installed, asked directly: the architecture gate in status_of
+    # is about whether something CAN be installed, which for an app already on
+    # the machine is settled.
+    ( load_app "$id"; [[ $app_tier == 3 ]] && app_installed ) >/dev/null 2>&1 || continue
+    "$OMAKEB_PATH/bin/omakeb-install-app" upgrade "$id" || failed+=("$id")
+  done
+  if (( ${#failed[@]} )); then
+    die "could not upgrade: ${failed[*]}"
+  fi
+}
+
+# Picker. In install mode, unavailable apps stay listed but marked, so "why is
+# Edge not here?" has a visible answer instead of the row silently vanishing.
+# In remove mode only installed apps are offered — a remove list full of things
+# that are not installed is noise.
+cmd_pick() {
+  local mode=${1:-install}
+  local id status label rows=() ids=() idx prompt
+
+  for id in $(app_ids); do
+    status=$(status_of "$id")
+    label="$( ( load_app "$id"; echo "$app_name" ) )"
+    if [[ $mode == remove ]]; then
+      [[ $status == installed ]] || continue
+      rows+=("$label")
+    else
+      case "$status" in
+        installed)   rows+=("$label  ✓ installed") ;;
+        unavailable) rows+=("$label  — not available for $(arch_dpkg)") ;;
+        *)           rows+=("$label") ;;
+      esac
+    fi
+    ids+=("$id")
+  done
+
+  if (( ${#ids[@]} == 0 )); then
+    if [[ $mode == remove ]]; then
+      notify-send -a omakeb "Remove" "No omakeb-managed applications are installed." 2>/dev/null ||
+        echo "no omakeb-managed applications are installed"
+      return 0
+    fi
+    die "no apps defined in $APPS_DIR"
+  fi
+
+  prompt="Install  "
+  [[ $mode == remove ]] && prompt="Remove  "
+
+  if command -v fuzzel >/dev/null 2>&1; then
+    idx=$(printf '%s\n' "${rows[@]}" | fuzzel --dmenu --index --prompt="$prompt" --width=52) || return 0
+  else
+    printf '%s\n' "${rows[@]}" | nl -w2 -s') '
+    read -rp "number: " idx
+    idx=$((idx - 1))
+  fi
+  [[ -n ${idx:-} ]] || return 0
+  (( idx >= 0 && idx < ${#ids[@]} )) || return 0
+
+  id=${ids[idx]}
+  if [[ $mode == remove ]]; then
+    cmd_remove "$id"
+  elif [[ "$(status_of "$id")" == installed ]]; then
+    log_skip "$( ( load_app "$id"; echo "$app_name" ) ) is already installed"
+  else
+    cmd_install "$id"
+  fi
+}
+
+case "${1:-pick}" in
+  list) cmd_list ;;
+  install)
+    shift
+    # `install` with no app name opens the picker, so the menu can call one
+    # command for both the interactive and the scripted path.
+    if [[ $# -eq 0 ]]; then cmd_pick install; else cmd_install "$1"; fi
+    ;;
+  remove)
+    shift
+    if [[ $# -eq 0 ]]; then cmd_pick remove; else cmd_remove "$1"; fi
+    ;;
+  upgrade)
+    shift
+    if [[ $# -eq 0 ]]; then cmd_upgrade_all; else cmd_upgrade "$1"; fi
+    ;;
+  pick) shift; cmd_pick "${1:-install}" ;;
+  *)    die "usage: omakeb-install-app [list|install [app]|remove [app]|upgrade [app]]" ;;
+esac

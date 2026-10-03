@@ -1,0 +1,48 @@
+# SYNTHETIC fixture, written for omakeb. Not vendored from any theme repo.
+#
+# Generation 1 (Omarchy v1/v2) themes have no colors.toml at all — roughly 29%
+# of the community index is still in this shape. Their only palette is an
+# Alacritty config, which lib/theme.py back-derives with `from-alacritty`.
+#
+# The real gen-1 themes we sampled (Gazler/omarchy-solarized-theme,
+# Swarnim114/omarchy-monochrome-theme) carry no LICENSE file, so we did not
+# vendor one. This reproduces the SHAPE we have to parse — Alacritty's own
+# documented [colors.primary] / [colors.normal] / [colors.bright] schema — with
+# the Solarized Dark values, which are Ethan Schoonover's published palette.
+#
+# What it exercises: the whole back-derivation path, plus every semantic key
+# arriving through a color0..15 fallback rather than being declared.
+
+[colors]
+
+[colors.primary]
+background = '#002b36'
+foreground = '#839496'
+
+[colors.cursor]
+text = '#002b36'
+cursor = '#93a1a1'
+
+[colors.selection]
+text = 'CellForeground'
+background = '#073642'
+
+[colors.normal]
+black = '#073642'
+red = '#dc322f'
+green = '#859900'
+yellow = '#b58900'
+blue = '#268bd2'
+magenta = '#d33682'
+cyan = '#2aa198'
+white = '#eee8d5'
+
+[colors.bright]
+black = '#002b36'
+red = '#cb4b16'
+green = '#586e75'
+yellow = '#657b83'
+blue = '#839496'
+magenta = '#6c71c4'
+cyan = '#93a1a1'
+white = '#fdf6e3'

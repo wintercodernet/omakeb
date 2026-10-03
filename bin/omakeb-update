@@ -1,0 +1,414 @@
+#!/bin/bash
+
+# omakeb:summary=Pull the latest omakeb, apply migrations, and reconverge this machine.
+# omakeb:args=[--no-pull] [--no-converge] [--no-upgrade]
+
+# The update path, in order:
+#
+#   1. git pull            get the new code
+#      release drift       apt files naming another release? then skip 2 and 3
+#   2. migrations          retire whatever an older omakeb left behind
+#   3. converge            re-run the install steps
+#   4. apt upgrade         Debian's own packages
+#   5. report              tier-3 staleness, apt health
+#
+# Step 3 is the important design choice and it is worth stating plainly:
+# **update does not have its own idea of what a configured machine looks like.**
+# It re-runs `install/[0-9][0-9]-*.sh`, the same steps `install.sh` runs, in the
+# same order. Every one of them is idempotent and the harness asserts it, so on
+# a machine that is already current this rewrites nothing and prints a wall of
+# "unchanged".
+#
+# The alternative — an update that pulls, migrates and re-renders templates but
+# does not reconverge — means a second definition of the target state, drifting
+# against the first. A package added to packages/desktop.list would reach fresh
+# installs and no existing machine; every such addition would need a migration
+# written by hand, and the one that gets forgotten fails silently on somebody
+# else's box months later. This project has been bitten by silent divergence
+# often enough that a second code path for
+# the same outcome is not worth the runtime it saves.
+#
+# What update does NOT do is run preflight. Preflight refuses to proceed on
+# anything that is not Debian 13 — correct for an installer, wrong here, because
+# a machine that has moved to the next release is exactly the machine whose
+# owner needs update to tell them something useful rather than exit 1. The
+# release-drift check after the pull does that instead.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+export OMAKEB_PATH
+source "$OMAKEB_PATH/lib/all.sh"
+
+# ------------------------------------------------------------------------------
+# Options
+# ------------------------------------------------------------------------------
+
+do_pull=1
+do_converge=1
+do_upgrade=1
+# Kept for the re-exec below. A plain assignment rather than a guarded one:
+# `arr=("$@")` with no positional parameters is a safe empty assignment on both
+# bash 3.2 and 5.2. It is only EXPANDING an empty array under `set -u` that
+# bash 3.2 objects to, and the one expansion below is guarded by a count.
+original_args=("$@")
+
+while [[ ${1:-} == -* ]]; do
+  case "$1" in
+    --no-pull)     do_pull=;      shift ;;
+    --no-converge) do_converge=;  shift ;;
+    --no-upgrade)  do_upgrade=;   shift ;;
+    -h|--help)
+      cat <<'USAGE'
+usage: omakeb-update [--no-pull] [--no-converge] [--no-upgrade]
+
+Pulls the omakeb checkout, applies pending migrations, re-runs the install
+steps to reconverge this machine, then upgrades Debian's packages.
+
+  --no-pull      use the checkout as it is on disk; do not fetch
+  --no-converge  skip re-running the install steps (migrations still run)
+  --no-upgrade   skip apt upgrade; omakeb's own changes are still applied
+
+Every step is idempotent. On a machine that is already current this changes
+nothing and says so.
+USAGE
+      exit 0 ;;
+    *) die "unknown option: $1
+Try: omakeb-update --help" ;;
+  esac
+done
+[[ $# -eq 0 ]] || die "omakeb-update takes no arguments (got: $*)"
+
+# ------------------------------------------------------------------------------
+# One at a time
+# ------------------------------------------------------------------------------
+#
+# Two updates racing would interleave apt operations, migrations and writes into
+# ~/.config. The menu makes this easy to trigger by accident — the row is one
+# keypress away and a slow update looks like nothing happening.
+state_init
+lock="$OMAKEB_STATE/update.lock"
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$lock"
+  flock -n 9 || die "another omakeb update is already running."
+fi
+
+# ------------------------------------------------------------------------------
+# 1. Pull
+# ------------------------------------------------------------------------------
+#
+# THE HAZARD HERE IS THAT WE ARE UPDATING THE SCRIPT WE ARE RUNNING.
+#
+# bash reads a script incrementally, by byte offset, as it executes — it does
+# not slurp the file first. Rewriting bin/omakeb-update underneath a running
+# bash means the next read comes from a different file at the old offset, and
+# what runs next is whatever text happens to live there. The failure is not a
+# clean error; it is a fragment of a line executing as a command. The same
+# applies to every lib/*.sh sourced above.
+#
+# So: pull, and if HEAD actually moved, hand over to the new version with exec
+# rather than carrying on inside the old one. OMAKEB_UPDATE_PULLED stops that
+# becoming a loop if something goes wrong with the comparison.
+
+pull_state=skipped
+
+git_head() { git -C "$OMAKEB_PATH" rev-parse HEAD 2>/dev/null || true; }
+
+if [[ -n ${OMAKEB_UPDATE_PULLED:-} ]]; then
+  log_step "pull"
+  log_skip "already pulled; running the updated code"
+  pull_state=done
+elif [[ -z $do_pull ]]; then
+  log_step "pull"
+  log_skip "--no-pull: using the checkout as it is on disk"
+elif ! command -v git >/dev/null 2>&1; then
+  log_step "pull"
+  log_warn "git is not installed; cannot update the checkout"
+elif ! git -C "$OMAKEB_PATH" rev-parse --git-dir >/dev/null 2>&1; then
+  log_step "pull"
+  log_skip "$OMAKEB_PATH is not a git checkout; nothing to pull"
+  log_info "Everything below still runs against the files on disk."
+else
+  log_step "pull"
+
+  # A dirty tree is a warning, not an error. Someone editing their own copy
+  # still wants the migrations, the reconverge and the apt upgrade — refusing
+  # the whole update because of an uncommitted comment would be obnoxious.
+  # It is only the pull that is unsafe, because it is the only part that would
+  # touch their work.
+  if [[ -n "$(git -C "$OMAKEB_PATH" status --porcelain 2>/dev/null)" ]]; then
+    log_warn "the checkout has uncommitted changes; not pulling."
+    git -C "$OMAKEB_PATH" status --short 2>/dev/null | sed 's/^/    /' >&2 || true
+    log_warn "Commit or stash them, then re-run. Continuing with what is on disk."
+  elif ! git -C "$OMAKEB_PATH" rev-parse --abbrev-ref '@{upstream}' >/dev/null 2>&1; then
+    log_skip "this branch tracks no upstream; nothing to pull"
+  else
+    before=$(git_head)
+    # --ff-only: an update must never produce a merge commit or a conflicted
+    # tree in someone's ~/.local/share. If it cannot fast-forward, the checkout
+    # has diverged and that is a person's problem to look at, not a script's.
+    if git -C "$OMAKEB_PATH" pull --ff-only --quiet; then
+      after=$(git_head)
+      if [[ $before == "$after" ]]; then
+        log_skip "already up to date ($(git -C "$OMAKEB_PATH" rev-parse --short HEAD 2>/dev/null))"
+        pull_state=current
+      else
+        log_ok "updated $(git -C "$OMAKEB_PATH" rev-parse --short "$before" 2>/dev/null) -> $(git -C "$OMAKEB_PATH" rev-parse --short HEAD 2>/dev/null)"
+        # Release the lock explicitly. The exec'd process re-opens fd 9 over
+        # the same path, which closes this description and drops the lock
+        # anyway, but doing it here keeps the ordering obvious.
+        if command -v flock >/dev/null 2>&1; then exec 9>&-; fi
+        log_info "restarting with the new code"
+        export OMAKEB_UPDATE_PULLED=1
+        if [[ ${#original_args[@]} -gt 0 ]]; then
+          exec bash "$OMAKEB_PATH/bin/omakeb-update" "${original_args[@]}"
+        else
+          exec bash "$OMAKEB_PATH/bin/omakeb-update"
+        fi
+      fi
+    else
+      log_warn "git pull --ff-only failed; the checkout may have diverged."
+      log_warn "Look at: git -C $OMAKEB_PATH status"
+      log_warn "Continuing with what is on disk."
+    fi
+  fi
+fi
+
+# ------------------------------------------------------------------------------
+# Release drift
+# ------------------------------------------------------------------------------
+#
+# D13. install/10-sources.sh writes `Suites: <target>-backports` and a pin
+# naming it, and lib/apps.sh's components source names <target>,
+# <target>-updates and <target>-security — the release omakeb targets,
+# lib/release.sh. On a machine that has since moved to the next Debian release
+# those files name the wrong release: the suites go stale and eventually stop
+# resolving, and by fact 17 a source that does not resolve breaks every apt
+# operation on the box.
+#
+# Checked HERE — after the pull and any re-exec, so it is the new code judging
+# the machine, and before migrations and converge. It used to sit in the report
+# at the end, which it never reached: converge sources 10-sources.sh, which on
+# such a machine died on the pin check with a message about pinning rather than
+# about the release.
+#
+# Reported, not repaired. Rewriting apt sources unattended on a machine in the
+# middle of a release upgrade is how a working system becomes an unbootable
+# one; and this is not the common case, it is the case where a human should
+# look. So on drift:
+#
+#   - migrations and converge are skipped. Both are the target-release code
+#     acting on the machine, which is exactly what should wait for a human.
+#     Pending migrations are recorded as pending and run on the first update
+#     after the sources are fixed; nothing is lost by deferring them.
+#   - apt upgrade still runs. It is Debian's own packages from the user's own
+#     sources, it is `upgrade` and never removes anything (see step 4), and it
+#     cannot pull the stale suite onto the machine: the backports pin is 100
+#     globally, and the promoted 500 only ties with the running release's main,
+#     so apt keeps the newer version and never downgrades to the old suite. On
+#     a box that has finished its release upgrade it is how security fixes keep
+#     arriving; on one mid-upgrade it takes the apt lock like any other apt run,
+#     so it cannot interleave with the person's own.
+#
+# The check compares the files against the RUNNING release (release_stale_suites
+# explains why), so a sid machine installed on purpose, which never got a
+# backports file, is not drift.
+backports_sources=/etc/apt/sources.list.d/omakeb-backports.sources
+backports_pins=/etc/apt/preferences.d/omakeb-backports
+release_drift=$(release_stale_suites "$backports_sources" "$OMAKEB_COMPONENTS_SOURCE")
+running_codename=$(release_codename)
+
+if [[ -n $release_drift ]]; then
+  log_step "release"
+  log_warn "this machine runs Debian '${running_codename:-unknown}', but omakeb's apt files name another release:"
+  printf '%s\n' "$release_drift" | sed 's/^/      /' >&2
+  log_warn "Those suites no longer match the release. They will go stale and then"
+  log_warn "break every apt operation on this box."
+  log_warn "omakeb targets Debian $OMAKEB_DEBIAN_CODENAME and has not been tested on '${running_codename:-unknown}'."
+  log_warn "Migrations and the reconverge are skipped until this is fixed by hand."
+  log_warn "To fix, deliberately:"
+  if grep -qF -- "$backports_sources" <<<"$release_drift"; then
+    log_warn "  sudo rm $backports_sources $backports_pins"
+  fi
+  if grep -qF -- "$OMAKEB_COMPONENTS_SOURCE" <<<"$release_drift"; then
+    log_warn "  sudo rm $OMAKEB_COMPONENTS_SOURCE"
+    log_warn "    (it only adds components such as contrib/non-free; if an app needs"
+    log_warn "     them, add them to your own sources for '${running_codename:-unknown}')"
+  fi
+  log_warn "  omakeb-update"
+  log_warn "install.sh is not the way back: its preflight accepts only Debian 13."
+  log_warn "With the files gone, update reconverges without backports and checks that"
+  log_warn "'${running_codename:-unknown}' itself carries the whole Hyprland stack; if it does not, step"
+  log_warn "10-sources stops and lists exactly what is missing."
+  do_converge=
+  skipped_for_drift=1
+else
+  skipped_for_drift=
+fi
+
+# ------------------------------------------------------------------------------
+# sudo
+# ------------------------------------------------------------------------------
+#
+# Asked for once, up front, rather than partway through an apt operation nobody
+# is watching. Skipped entirely when there is nothing that needs root.
+if [[ -n $do_converge || -n $do_upgrade ]]; then
+  sudo_keepalive_start
+fi
+
+# ------------------------------------------------------------------------------
+# 2 + 3. Migrations, then converge
+# ------------------------------------------------------------------------------
+#
+# install/05-migrations.sh is the first of the numbered steps, so migrations
+# come out of the same loop. With --no-converge it is run on its own: skipping
+# the reconverge is a reasonable thing to want, skipping the migrations while
+# taking the new code is not.
+
+if [[ -n $do_converge ]]; then
+  trap 'log_error "update failed during step: ${OMAKEB_STEP:-unknown}"' ERR
+  for step in "$OMAKEB_PATH"/install/[0-9][0-9]-*.sh; do
+    OMAKEB_STEP="$(basename "$step" .sh)"
+    log_step "$OMAKEB_STEP"
+    source "$step"
+  done
+  trap - ERR
+  unset OMAKEB_STEP
+elif [[ -n $skipped_for_drift ]]; then
+  log_step "05-migrations"
+  log_skip "release drift: migrations deferred until omakeb's apt files match the release"
+  log_step "converge"
+  log_skip "release drift: install steps not re-run (see above)"
+else
+  log_step "05-migrations"
+  migrate_run_pending
+  log_step "converge"
+  log_skip "--no-converge: install steps not re-run"
+fi
+
+# ------------------------------------------------------------------------------
+# 4. Debian's own packages
+# ------------------------------------------------------------------------------
+#
+# `upgrade`, never `dist-upgrade`/`full-upgrade`. full-upgrade is allowed to
+# REMOVE packages to resolve a conflict, and an unattended run that quietly
+# takes hyprland off a machine is not an update, it is an outage.
+#
+# --with-new-pkgs is what Debian's own `apt upgrade` does and plain
+# `apt-get upgrade` does not: it permits installing a NEW package when an
+# existing one now depends on it, without permitting any removal. The pinned
+# backports stack needs it — a hyprland point release that gains a
+# libhyprtoolkit dependency is held back forever otherwise, and held-back
+# packages are the sort of thing nobody notices for a year.
+#
+# Backports cannot leak in here: install/10-sources.sh pins the suite to 100,
+# so apt never chooses it as a candidate for anything outside the promoted glob.
+if [[ -n $do_upgrade ]]; then
+  log_step "apt upgrade"
+  apt_refresh
+  if sudo "${APT_ENV[@]}" apt-get --with-new-pkgs upgrade -y -q; then
+    log_ok "Debian packages upgraded"
+  else
+    log_warn "apt upgrade did not complete; see the output above"
+  fi
+else
+  log_step "apt upgrade"
+  log_skip "--no-upgrade: Debian packages not touched"
+fi
+
+# ------------------------------------------------------------------------------
+# 5. Reports
+# ------------------------------------------------------------------------------
+
+log_step "report"
+
+# --- tier 3 -------------------------------------------------------------------
+#
+# D4: tier 3 gets security updates from nobody, so its versions are ours to
+# track and ours to report. The base install has exactly one item (D8), the Nerd
+# Font symbols. install/50-fonts.sh sets NERD_FONTS_VERSION and, having been
+# sourced by the converge loop above, has left it in this shell — so the pinned
+# value comes from the same place that installs it rather than from a second
+# copy of the version number here.
+installed_fonts=$(state_get nerd-symbols-version)
+pinned_fonts="${NERD_FONTS_VERSION:-}"
+if [[ -z $installed_fonts ]]; then
+  log_warn "Nerd Font symbols: not installed — icons in the bar and menu will be empty boxes"
+elif [[ -z $pinned_fonts ]]; then
+  log_info "Nerd Font symbols: $installed_fonts"
+elif [[ $installed_fonts == "$pinned_fonts" ]]; then
+  log_ok "Nerd Font symbols: $installed_fonts (current)"
+else
+  log_warn "Nerd Font symbols: $installed_fonts installed, $pinned_fonts pinned — the download did not succeed"
+fi
+
+# The optional tier-3 apps (apps/*.sh): each records app-version/<id> when it
+# installs, and each that can say what upstream's latest is gets compared here.
+# Reported, not upgraded — an update run should not pull new third-party code
+# nobody asked for; `omakeb-install-app upgrade` does that on request.
+#
+# In a subshell and behind `||`: this is network-dependent and reads state an
+# older omakeb may have written, and under `set -euo pipefail` a single unbound
+# variable in there would otherwise end the update. tier3_report tolerates
+# failure itself; this is the second belt.
+( tier3_report ) || log_warn "tier-3 apps: the staleness check itself failed; run omakeb-install-app list"
+
+# --- apt health ---------------------------------------------------------------
+#
+# Known apt behaviour: `apt-get update` prints "E: The repository ... is not
+# signed." and exits 0. And that one repository then breaks every later apt
+# operation, including ones that have nothing to do with it. Neither shows up as
+# a failure anywhere, so the only way to know is to read the output — and the
+# right moment is now, when someone is watching, rather than during an install
+# three weeks from now that fails for no visible reason.
+# Both the status AND the output, for the reason repo_usable checks both: a
+# signature apt cannot verify is an error it reports and still exits 0 on, while
+# apt failing outright exits non-zero and prints none of these strings. Checking
+# only the output reports a healthy machine when apt did not run at all.
+#
+# Only when root is already available. `apt-get update` needs it to write the
+# lists, and a run told to touch nothing — `--no-converge --no-upgrade` — must
+# not be the thing that pops a sudo prompt. sudo_keepalive_start has warmed the
+# timestamp whenever converge or upgrade ran, so in the normal case this is
+# free; on a machine with a NOPASSWD rule it always runs.
+if ! sudo -n true 2>/dev/null; then
+  log_skip "apt repositories not checked: this run needed no root, and the check would prompt"
+  apt_health=
+  apt_health_rc=0
+  apt_health_skipped=1
+else
+  apt_health_skipped=
+  set +e
+  apt_health=$(sudo "${APT_ENV[@]}" apt-get update -o APT::Get::List-Cleanup=0 2>&1)
+  apt_health_rc=$?
+  set -e
+fi
+if [[ -n ${apt_health_skipped:-} ]]; then
+  :
+elif (( apt_health_rc != 0 )); then
+  log_warn "apt-get update failed (exit $apt_health_rc):"
+  printf '%s\n' "$apt_health" | tail -5 | sed 's/^/    /' >&2
+elif grep -qiE 'is not signed|NO_PUBKEY|GPG error|Failed to fetch|does not have a Release file' <<<"$apt_health"; then
+  log_warn "one or more apt repositories are unusable:"
+  grep -iE '^(E|W):|is not signed|NO_PUBKEY|GPG error|Failed to fetch|does not have a Release file' \
+    <<<"$apt_health" | sort -u | sed 's/^/    /' >&2
+  log_warn "apt reports these on EVERY operation, so unrelated installs will fail too."
+  log_warn "Remove the offending source from /etc/apt/sources.list.d/ to clear it."
+else
+  log_ok "all apt repositories verify"
+fi
+
+# --- release drift ------------------------------------------------------------
+#
+# The check itself ran before converge (see "Release drift" above); this only
+# repeats the verdict where someone skimming the end of the output will see it.
+if [[ -n $skipped_for_drift ]]; then
+  log_warn "release drift: omakeb's apt files do not match Debian '${running_codename:-unknown}'; converge was skipped (see the top of this run)"
+else
+  log_ok "omakeb's apt files match the running release (${running_codename:-unknown})"
+fi
+
+if [[ -n $skipped_for_drift ]]; then
+  log_done "omakeb checked this machine but did not reconverge it; fix the release drift above."
+else
+  log_done "omakeb is up to date."
+fi

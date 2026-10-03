@@ -1,0 +1,67 @@
+#!/bin/bash
+
+# omakeb:summary=Open a terminal, optionally running tmux.
+# omakeb:args=[tmux]
+
+# The binding is `exec, omakeb-launch-terminal` rather than `exec, kitty` so the
+# terminal can be changed in ~/.config/omakeb/apps.conf without a compositor
+# reload (C2). Defaults live here, not in that file, so a user who deletes a
+# line gets the default back.
+
+set -euo pipefail
+
+notify() {
+  command -v notify-send >/dev/null &&
+    notify-send -a omakeb \
+      -h string:x-canonical-private-synchronous:omakeb-launch "$@" || true
+}
+
+# apps.conf is a user-owned file that may be absent, partial, or wrong. `set -e`
+# is lifted across the source so a bad line degrades to defaults instead of
+# turning the key into a silent no-op.
+load_apps_conf() {
+  local conf="${OMAKEB_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/omakeb}/apps.conf"
+  [[ -r $conf ]] || return 0
+  set +e
+  # shellcheck source=/dev/null
+  source "$conf"
+  set -e
+}
+
+load_apps_conf
+TERMINAL=${TERMINAL:-kitty}
+TMUX_SESSION=${TMUX_SESSION:-main}
+
+if ! command -v "$TERMINAL" >/dev/null; then
+  notify "omakeb" "Terminal '$TERMINAL' is not installed. Check apps.conf."
+  exit 1
+fi
+
+# `-e` is the near-universal spelling; foot takes the command as trailing args.
+run_in_terminal() {
+  case "${TERMINAL##*/}" in
+    foot | footclient) exec "$TERMINAL" "$@" ;;
+    *) exec "$TERMINAL" -e "$@" ;;
+  esac
+}
+
+case "${1-}" in
+  "")
+    exec "$TERMINAL"
+    ;;
+  tmux)
+    if ! command -v tmux >/dev/null; then
+      # The user asked for a terminal and pressed a key; give them one anyway
+      # rather than nothing at all, and say why it is not the one they wanted.
+      notify "omakeb" "tmux is not installed; opening a plain terminal."
+      exec "$TERMINAL"
+    fi
+    # new-session -A attaches to an existing session of that name or creates it,
+    # in one call and without the race of `has-session` then `new`/`attach`.
+    run_in_terminal tmux new-session -A -s "$TMUX_SESSION"
+    ;;
+  *)
+    notify "omakeb" "omakeb-launch-terminal: unknown argument '$1'"
+    exit 2
+    ;;
+esac

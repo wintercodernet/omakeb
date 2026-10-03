@@ -1,0 +1,117 @@
+#!/bin/bash
+
+# omakeb:summary=Start a screen recording, or stop the one in progress.
+# omakeb:args=[region] [audio]
+
+# One key does both halves: the binding has no modifier to spare for "stop",
+# and a recording you cannot stop from the keyboard is a trap. A running
+# wf-recorder is therefore the state — no pidfile to go stale.
+#
+# wf-recorder must be sent SIGINT, not SIGTERM: it finalises the container on
+# INT and leaves an unplayable file on TERM.
+#
+# wf-recorder's output goes to $OMAKEB_STATE/screenrecording.log, overwritten
+# each run. It used to go to /dev/null, and "Recording" was announced without
+# checking: a bad codec, a missing portal or an output that had gone away all
+# looked exactly like success until stop turned up no file. The silent failure
+# is the recurring hazard in this stack, so start is now confirmed, and stop
+# says when the file is empty or missing.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+log=$OMAKEB_STATE/screenrecording.log
+
+notify() { # <body> [timeout] [urgency]
+  notify-send -a omakeb -i media-record -t "${2:-5000}" -u "${3:-normal}" \
+    -h string:x-canonical-private-synchronous:omakeb-screenrecording \
+    "Screen recording" "$1"
+}
+
+if pgrep -x wf-recorder >/dev/null; then
+  pkill -INT -x wf-recorder || true
+
+  # Give the muxer a moment to write the index, so the notification does not
+  # claim a file that is still being finished.
+  for _ in $(seq 1 50); do
+    pgrep -x wf-recorder >/dev/null || break
+    sleep 0.1
+  done
+
+  file=$(state_get screenrecording)
+  # Cleared, so a wf-recorder started some other way and stopped here later is
+  # not reported as having saved this file.
+  rm -f "$OMAKEB_STATE/screenrecording"
+  if [[ -z $file ]]; then
+    notify "Stopped"
+  elif [[ -s $file ]]; then
+    notify "Saved to ${file/#$HOME/~}"
+  else
+    # Missing or zero bytes: wf-recorder died mid-way, or never wrote a frame.
+    # Saying "Saved" here is the exact lie this command used to tell.
+    if [[ -e $file && ! -s $file ]]; then rm -f "$file"; fi
+    notify "Stopped, but nothing was saved — ${file/#$HOME/~} is empty or missing. See ${log/#$HOME/~}" 0 critical
+  fi
+  exit 0
+fi
+
+command -v wf-recorder >/dev/null || {
+  notify "wf-recorder is not installed" 5000 critical
+  exit 1
+}
+
+directory=$(xdg-user-dir VIDEOS 2>/dev/null || true)
+[[ -n $directory ]] || directory=$HOME/Videos
+directory=$directory/Screenrecordings
+mkdir -p "$directory"
+file=$directory/screenrecording-$(date +%Y%m%d-%H%M%S).mp4
+
+region=
+audio=
+for argument in "$@"; do
+  case $argument in
+    region) region=1 ;;
+    audio)  audio=1 ;;
+  esac
+done
+
+recorder_args=(-f "$file")
+
+if [[ -n $region ]]; then
+  geometry=$(slurp -d 2>/dev/null || true)
+  [[ -n $geometry ]] || exit 0
+  recorder_args+=(-g "$geometry")
+else
+  output=$(hyprctl monitors -j 2>/dev/null |
+    jq -r 'first(.[] | select(.focused).name) // empty' 2>/dev/null || true)
+  [[ -n $output ]] && recorder_args+=(-o "$output")
+fi
+
+[[ -n $audio ]] && recorder_args+=(--audio)
+
+# Recorded BEFORE the start, so a stop pressed within the check below still
+# knows the file; cleared again if the start turns out to have failed.
+state_set screenrecording "$file"
+setsid -f wf-recorder "${recorder_args[@]}" >"$log" 2>&1 || true
+
+# wf-recorder fails fast — a bad codec, a portal that is not there or an output
+# name that has gone away all end it within a few hundred milliseconds — but it
+# does run briefly first, so a single early pgrep would see it alive and miss
+# the failure. Watch for up to half a second, stopping as soon as it is gone.
+for _ in 1 2 3 4 5; do
+  pgrep -x wf-recorder >/dev/null || break
+  sleep 0.1
+done
+
+if ! pgrep -x wf-recorder >/dev/null; then
+  rm -f "$OMAKEB_STATE/screenrecording"
+  if [[ -e $file && ! -s $file ]]; then rm -f "$file"; fi
+  reason=$(sed '/^[[:space:]]*$/d' "$log" 2>/dev/null | tail -n 1 || true)
+  notify "wf-recorder did not start: ${reason:-no output}. Full log: ${log/#$HOME/~}" 0 critical
+  exit 1
+fi
+
+# No timeout: the only reminder that the screen is being recorded is this
+# notification, and it is replaced by the "saved" one when recording stops.
+notify "Recording — press the same key again to stop" 0

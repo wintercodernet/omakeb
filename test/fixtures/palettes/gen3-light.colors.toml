@@ -1,0 +1,18 @@
+# SYNTHETIC fixture, written for omakeb. Not vendored from any theme repo.
+#
+# A light theme that never says so. `mode` is absent and there is no theme_type
+# and no light.mode marker, so the only signal left is the luminance rule:
+# R+G+B > 382 on the background means light. Getting this wrong picks
+# Papirus-Dark icons and prefer-dark GTK on a white desktop.
+
+background = "#fafafa"
+foreground = "#383a42"
+accent = "#4078f2"
+selection = "#d0d0d0"
+muted = "#a0a1a7"
+red = "#e45649"
+yellow = "#c18401"
+green = "#50a14f"
+cyan = "#0184bc"
+blue = "#4078f2"
+magenta = "#a626a4"

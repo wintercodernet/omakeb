@@ -1,0 +1,114 @@
+# Tier 1, trixie main. The graphical stack minus the Hyprland packages
+# themselves, which come from backports (see packages/backports.list).
+
+# terminal (D6)
+kitty
+
+# bar, launcher, notifications
+waybar
+fuzzel
+mako-notifier       # NB: binary package is mako-notifier, not mako
+
+# wayland utilities
+wl-clipboard
+cliphist
+grim
+slurp
+swappy
+swaybg
+wlr-randr
+wtype
+wf-recorder        # required by omakeb-capture-screenrecording
+
+# hardware controls
+brightnessctl
+playerctl
+pamixer
+pavucontrol
+
+# audio
+pipewire
+pipewire-pulse
+pipewire-alsa
+wireplumber
+
+# The command-line mixers. pavucontrol above is the GUI, and shipping only the
+# GUI is what made a real fault on the test machine hard to find: the volume
+# meter moved, the right device was selected, and the headphones were silent —
+# because the mute was in the ALSA hardware mixer, one layer below anything
+# PipeWire will show you. There was no tool installed that could look there.
+#
+#   alsa-utils        amixer, alsamixer, aplay, speaker-test
+#   pulseaudio-utils  pactl, pacmd — the pipewire-pulse side
+#
+# omakeb-hw-audio needs amixer; without it the check degrades to what PipeWire
+# alone can see, which is precisely the layer that reports success.
+alsa-utils
+pulseaudio-utils
+
+# network + bluetooth
+network-manager
+network-manager-gnome
+bluez
+blueman
+
+# session plumbing
+greetd
+tuigreet            # NB: package is "tuigreet", not "greetd-tuigreet"
+polkitd
+mate-polkit         # lightweight polkit agent; no KDE/GNOME session pulled in
+gnome-keyring
+xdg-desktop-portal
+xdg-desktop-portal-gtk
+xdg-user-dirs
+qt6-wayland
+libnotify-bin
+
+# applications
+thunar
+imv
+mpv
+
+# browser (D13)
+#
+# Debian names it firefox-esr, not firefox. It is here because a desktop with no
+# browser is not a desktop: five learn.* rows in menu/menu.jsonc call
+# omakeb-launch-browser, and on a fresh machine there was nothing for them to
+# open — they reached the "No browser found" notification instead.
+#
+# It is the FALLBACK, not the preference. omakeb-launch-browser and
+# omakeb-launch-webapp both try chromium first, because Chromium's --app gives a
+# real chromeless window and Firefox has had no equivalent since --app was
+# removed. Install chromium and it takes over with no configuration at all.
+firefox-esr
+
+# fonts + icons
+#
+# JetBrains Mono is the only family omakeb ever names. Font family is an omakeb
+# constant and never a theme token, so a theme
+# cannot ask for a face that is not installed; test/lint-fonts.py asserts that
+# every family named in templates/ and default/ is provided by a package here.
+fonts-jetbrains-mono
+
+# The rest is COVERAGE, not style, and it is the reason this section grew.
+# Without it anything outside JetBrains Mono's own repertoire renders as tofu
+# boxes everywhere at once — filenames in thunar, window titles in the bar,
+# notification bodies, web pages — and nothing anywhere reports it. Silent
+# degradation is this project's recurring hazard; this is its font-shaped face.
+#
+#   noto-core    Greek, Cyrillic, Arabic, Hebrew, Devanagari, Thai and the rest
+#                of the non-CJK world
+#   noto-cjk     Chinese, Japanese, Korean. Much the largest thing in the base
+#                install; delete this one line if disk matters more than the
+#                tofu, nothing depends on it
+#   dejavu-core  a guaranteed proportional face so fontconfig's `sans-serif`
+#                alias resolves to something. GTK asks for sans-serif by
+#                default and a netinst with no desktop task may ship no
+#                proportional font at all
+#   color-emoji  emoji, in the menu and in notifications
+fonts-noto-core
+fonts-noto-cjk
+fonts-dejavu-core
+fonts-noto-color-emoji
+
+papirus-icon-theme

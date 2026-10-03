@@ -1,0 +1,48 @@
+# SYNTHETIC fixture, written for omakeb. Not vendored from any theme repo.
+#
+# We could not find a still-published theme using the legacy short spellings
+# that carried a licence, so this reproduces the shape rather than a specific
+# theme. It is the generation-2 key soup the research describes: legacy short
+# names (bg, dark_fg), canonical names, ANSI names and invented ones all in one
+# file, some of them contradicting each other.
+#
+# What it exercises:
+#   * the legacy short aliases, resolved in both directions
+#   * `purple` as a synonym for `magenta`
+#   * `theme_type` as a synonym for `mode`
+#   * an invented key (`active_border_color`) being ignored without complaint
+#   * `urgent`, which the format has no room for and upstream drops silently —
+#     we announce it instead
+#   * a value we must refuse to substitute into a config file
+
+theme_type = "dark"
+
+bg = "#1d1f21"
+dark_bg = "#141618"
+lighter_bg = "#282a2e"
+fg = "#c5c8c6"
+dark_fg = "#707880"
+bright_fg = "#ffffff"
+
+accent = "#81a2be"
+purple = "#b294bb"
+
+color0 = "#1d1f21"
+color1 = "#cc6666"
+color2 = "#b5bd68"
+color3 = "#f0c674"
+color4 = "#81a2be"
+color5 = "#b294bb"
+color6 = "#8abeb7"
+color7 = "#c5c8c6"
+
+# Invented by the theme author; upstream has no such key and neither do we.
+active_border_color = "#81a2be"
+
+# There is no `urgent` key in the palette format. Upstream drops one silently;
+# we say so and use red.
+urgent = "#cc6666"
+
+# Refused by the value filter: this is substituted into waybar's CSS and
+# Hyprland's config, and a value carrying braces or semicolons is an injection.
+injected = "#000; } * { background: red"

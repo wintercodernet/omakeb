@@ -1,0 +1,51 @@
+# omakeb theme — Tokyo Night.
+#
+# The omakeb palette format. Deliberately key-compatible with the colors.toml
+# that Omarchy themes use, so omakeb-theme-install can import one without a
+# translation table (D11). Every key below is optional: lib/theme.py fills in
+# what a theme does not declare, so a palette with only `background` and
+# `color0..15` still renders. Declaring them makes the result exact instead of
+# derived.
+#
+# Values are plain "#rrggbb". Nothing here is written into a config file
+# verbatim — the templates decide whether a colour needs a leading '#'
+# (waybar, gtk, kitty), no '#' at all (fuzzel) or rgb()/rgba() form (Hyprland,
+# hyprlock), which is why the palette does not have to care.
+
+mode = "dark"
+
+accent = "#7aa2f7"
+selection = "#283457"
+muted = "#565f89"
+
+background = "#1a1b26"
+dark_background = "#16161e"
+darker_background = "#0f0f14"
+lighter_background = "#24283b"
+
+foreground = "#c0caf5"
+dark_foreground = "#565f89"
+light_foreground = "#a9b1d6"
+bright_foreground = "#ffffff"
+
+red = "#f7768e"
+yellow = "#e0af68"
+orange = "#ff9e64"
+green = "#9ece6a"
+cyan = "#7dcfff"
+blue = "#7aa2f7"
+magenta = "#bb9af7"
+brown = "#b4713a"
+
+bright_red = "#ff7a93"
+bright_yellow = "#ffc777"
+bright_green = "#b9f27c"
+bright_cyan = "#b4f9f8"
+bright_blue = "#7da6ff"
+bright_magenta = "#c7a9ff"
+
+# Optional, and the only key whose value is passed through to Hyprland verbatim:
+# hyprlang's gradient syntax is exactly this string. Without it the window
+# border is a flat rgb(<accent>).
+hyprland_active_border = "rgba(7aa2f7ee) rgba(bb9af7ee) 45deg"
+hyprland_inactive_border = "rgba(2a2a37aa)"

@@ -1,0 +1,126 @@
+#!/bin/bash
+
+# omakeb:summary=Fall back to software OpenGL when the GPU cannot drive GL apps.
+
+# Kitty — and anything else built on GLFW — needs a desktop OpenGL 3.3 core
+# context. A VM whose virtio-gpu has no 3D acceleration still exposes a render
+# node and a working EGL, so nothing looks wrong, but the context request fails:
+#
+#     EGL: Failed to create context: Arguments are inconsistent
+#     ValueError: Failed to create GLFWwindow
+#
+# The app dies instantly — a "blink", no window, no message the user ever sees.
+# Hyprland keeps running because it uses GLES, so you get a desktop with no
+# working terminal, which is close to unusable. GTK apps like Thunar are fine:
+# they fall back to software rendering on their own.
+#
+# Detection is by running the real thing rather than inferring from a version
+# string. An EGL probe written against libEGL directly reported "unavailable"
+# even where kitty demonstrably worked, so it is not trustworthy; the terminal
+# itself is the only honest test of whether the terminal will start.
+#
+# The answer is cached, because the probe costs a process start and briefly
+# flashes a window. The cache used to be kept forever, which was wrong in both
+# directions: a machine that first logged in on nouveau (or before the NVIDIA
+# driver loaded) stayed on llvmpipe with a perfectly good GPU, and a VM that
+# later gained 3D acceleration kept forcing software rendering — slowly, and
+# with nothing ever saying so. So the cache now records what it was measured
+# ON — the kernel release and the DRM drivers bound to each card — and is
+# thrown away when either changes. `omakeb-hw-nvidia enable`/`revert` also
+# delete it outright, because they change the GL stack without necessarily
+# changing either of those. Deleting $OMAKEB_STATE/gl-mode by hand still
+# forces a re-probe.
+#
+# File format: line 1 is the mode (hardware|software|unknown), line 2 the
+# fingerprint. A one-line file from before the fingerprint existed has no
+# line 2, never matches, and is re-probed once — which is always safe.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+mode_file=$OMAKEB_STATE/gl-mode
+# Overridable so test/lint-gl-fallback.sh can drive the fingerprint from a
+# fixture tree; nothing but the tests ever sets it.
+drm_class=${OMAKEB_SYSFS_DRM:-/sys/class/drm}
+
+# What the probe result depends on, as one line. The kernel release because a
+# kernel upgrade can bring or drop a DRM driver (and DKMS rebuilds NVIDIA's per
+# kernel); the driver NAMES bound to each card because that is what actually
+# changes on nouveau -> nvidia, or when a VM gains virtio-gpu 3D / virgl is
+# swapped for something else. Card nodes only — card0-DP-1 and friends are
+# connectors, not devices, and would just add noise.
+gl_fingerprint() {
+  local card driver drivers=
+  for card in "$drm_class"/card*; do
+    case ${card##*/} in *-*) continue ;; esac
+    [[ -L $card/device/driver ]] || continue
+    # Plain readlink, not -f: only the basename is wanted, and -f differs on
+    # macOS, where the tests run.
+    driver=$(readlink "$card/device/driver" 2>/dev/null) || continue
+    drivers="$drivers ${driver##*/}"
+  done
+  drivers=$(printf '%s\n' $drivers | sort -u | tr '\n' ',')
+  drivers=${drivers#,}
+  printf 'kernel=%s drm=%s\n' "$(uname -r 2>/dev/null || echo unknown)" "${drivers%,}"
+}
+
+write_mode() { printf '%s\n%s\n' "$1" "$fingerprint" > "$mode_file"; }
+
+apply_software() {
+  # Three mechanisms, because apps arrive by three routes:
+  #   hyprctl keyword env  — anything Hyprland spawns (keybindings, exec-once,
+  #                          and the app menu, since fuzzel is spawned by us)
+  #   systemctl --user     — anything started as a systemd user unit or via
+  #                          `uwsm app --`
+  #   dbus-update-...      — D-Bus activated services
+  hyprctl keyword env LIBGL_ALWAYS_SOFTWARE,1 >/dev/null 2>&1 || true
+  systemctl --user set-environment LIBGL_ALWAYS_SOFTWARE=1 >/dev/null 2>&1 || true
+  command -v dbus-update-activation-environment >/dev/null 2>&1 &&
+    dbus-update-activation-environment --systemd LIBGL_ALWAYS_SOFTWARE >/dev/null 2>&1 || true
+  export LIBGL_ALWAYS_SOFTWARE=1
+}
+
+# --- cached answer ------------------------------------------------------------
+fingerprint=$(gl_fingerprint)
+if [[ -r $mode_file ]]; then
+  cached_mode= cached_print=
+  { IFS= read -r cached_mode; IFS= read -r cached_print; } < "$mode_file" || true
+  if [[ $cached_print == "$fingerprint" ]]; then
+    if [[ $cached_mode == software ]]; then apply_software; fi
+    exit 0
+  fi
+  # Measured on a different GPU stack (or by a version that did not record
+  # one): the answer says nothing about this one. Fall through and re-probe.
+fi
+
+# --- probe --------------------------------------------------------------------
+terminal=kitty
+# shellcheck source=/dev/null
+[[ -r "$OMAKEB_CONFIG/apps.conf" ]] && source "$OMAKEB_CONFIG/apps.conf" 2>/dev/null || true
+terminal=${TERMINAL:-$terminal}
+command -v "$terminal" >/dev/null 2>&1 || exit 0
+
+probe() { timeout 20 "$terminal" --start-as=minimized --title omakeb-gl-probe sh -c 'exit 0' >/dev/null 2>&1; }
+
+state_init
+if probe; then
+  write_mode hardware
+  exit 0
+fi
+
+# Hardware GL failed. Confirm software actually fixes it before committing —
+# if it does not, the problem is something else and forcing llvmpipe would only
+# make the desktop slower for no reason.
+if LIBGL_ALWAYS_SOFTWARE=1 probe; then
+  write_mode software
+  apply_software
+  notify-send -a omakeb -i video-display \
+    "Software rendering" \
+    "This GPU cannot provide OpenGL 3.3, so GL apps run on llvmpipe. Normal in a VM without 3D acceleration." || true
+else
+  write_mode unknown
+  notify-send -a omakeb -u critical -i dialog-error \
+    "Terminal will not start" \
+    "$terminal failed with and without software rendering. Run '$terminal' from a TTY to see the error." || true
+fi

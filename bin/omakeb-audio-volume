@@ -1,0 +1,69 @@
+#!/bin/bash
+
+# omakeb:summary=Raise, lower or mute the volume.
+# omakeb:args=<up|down|mute|mic-mute> [step]
+
+# Bound with the `l` flag so it works on the lock screen (media.conf): nothing
+# here may touch the session, read a config file or need a terminal. Feedback is
+# a single notify-send with a stable synchronous hint, so holding the key
+# replaces one notification instead of stacking thirty.
+#
+# `pamixer --get-mute` exits 1 when the sink is *not* muted, which is a normal
+# outcome, not a failure — hence the `|| true` under `set -e`.
+
+set -euo pipefail
+
+action=${1:-}
+step=${2:-5}
+[[ $step =~ ^[0-9]+$ ]] || step=5
+
+notify() { # <summary> <body> <icon> <value>
+  notify-send -a omakeb -u low -t 1500 -i "$3" \
+    -h string:x-canonical-private-synchronous:omakeb-volume \
+    -h "int:value:$4" \
+    "$1" "$2"
+}
+
+case $action in
+  up)
+    # Raising from silence should also unmute, otherwise the bar moves and
+    # nothing comes out.
+    pamixer --unmute --increase "$step" >/dev/null
+    ;;
+  down)
+    pamixer --decrease "$step" >/dev/null
+    ;;
+  mute)
+    pamixer --toggle-mute >/dev/null
+    ;;
+  mic-mute)
+    pamixer --default-source --toggle-mute >/dev/null
+    if [[ $(pamixer --default-source --get-mute || true) == true ]]; then
+      notify "Microphone" "Muted" microphone-sensitivity-muted 0
+    else
+      notify "Microphone" "Live" microphone-sensitivity-high 100
+    fi
+    exit 0
+    ;;
+  *)
+    notify-send -a omakeb -u critical "omakeb-audio-volume" \
+      "Usage: omakeb-audio-volume up|down|mute|mic-mute [step]"
+    exit 2
+    ;;
+esac
+
+volume=$(pamixer --get-volume || true)
+[[ $volume =~ ^[0-9]+$ ]] || volume=0
+
+if [[ $(pamixer --get-mute || true) == true ]]; then
+  notify "Volume" "Muted" audio-volume-muted 0
+  exit 0
+fi
+
+if   (( volume >= 66 )); then icon=audio-volume-high
+elif (( volume >= 33 )); then icon=audio-volume-medium
+elif (( volume >   0 )); then icon=audio-volume-low
+else                          icon=audio-volume-muted
+fi
+
+notify "Volume" "${volume}%" "$icon" "$volume"

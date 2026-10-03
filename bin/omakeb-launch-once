@@ -1,0 +1,68 @@
+#!/bin/bash
+
+# omakeb:summary=Focus an app's existing window, or launch it if it has none.
+# omakeb:args=<command> [args...]
+
+# The settings-panel keys (SUPER+CTRL+A/B/W) are pressed to "open the audio
+# panel", not to "start another pavucontrol". Pressing one twice should return
+# to the window that is already there, on whatever workspace it is on.
+#
+# Matching is on window class, since that is what Hyprland reports and what
+# window rules key off. It is a heuristic: some apps set a class unrelated to
+# their binary name, in which case we simply launch a second copy — the same
+# thing that would have happened without this wrapper.
+
+set -euo pipefail
+
+notify() {
+  command -v notify-send >/dev/null &&
+    notify-send -a omakeb \
+      -h string:x-canonical-private-synchronous:omakeb-launch "$@" || true
+}
+
+if (($# == 0)); then
+  notify "omakeb" "omakeb-launch-once needs a command to run."
+  exit 2
+fi
+
+if ! command -v "$1" >/dev/null; then
+  notify "omakeb" "'$1' is not installed."
+  exit 1
+fi
+
+launch() { exec "$@"; }
+
+# No compositor socket or no jq means we cannot inspect windows; a plain launch
+# is the correct degradation, not an error.
+command -v hyprctl >/dev/null || launch "$@"
+command -v jq >/dev/null || launch "$@"
+
+want=$(printf '%s' "${1##*/}" | tr '[:upper:]' '[:lower:]')
+
+# Exact class match wins; substring is the fallback for wrapper-mangled classes
+# such as ".blueman-manager-wrapped". `|| true` because hyprctl exits non-zero
+# when there is no compositor to talk to.
+clients=$(hyprctl clients -j 2>/dev/null || true)
+
+address=""
+if [[ -n $clients ]]; then
+  address=$(printf '%s' "$clients" | jq -r --arg want "$want" '
+    def norm($s): ($s // "") | ascii_downcase;
+    ( [ .[] | select(norm(.class) == $want or norm(.initialClass) == $want) ] ) as $exact
+    | ( if ($exact | length) > 0 then $exact
+        else [ .[] | select((norm(.class) | index($want)) != null
+                         or (norm(.initialClass) | index($want)) != null) ]
+        end )
+    | .[0].address // empty
+  ' 2>/dev/null || true)
+fi
+
+if [[ -n $address ]]; then
+  # focuswindow follows the window to its workspace, so this works across
+  # workspaces and monitors without a separate `workspace` dispatch.
+  if hyprctl dispatch focuswindow "address:$address" >/dev/null 2>&1; then
+    exit 0
+  fi
+fi
+
+launch "$@"

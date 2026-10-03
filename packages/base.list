@@ -1,0 +1,40 @@
+# Tier 1, trixie main. Terminal environment and core tooling.
+# Every name here is verified present in trixie.
+
+# shell + navigation
+bash-completion
+fzf
+zoxide
+eza
+bat                 # binary is `batcat` on Debian; aliased in default/bash
+fd-find             # binary is `fdfind` on Debian; aliased in default/bash
+ripgrep
+tree
+less
+plocate
+
+# editor + multiplexer
+neovim              # 0.10.4 (D7) — config must pin plugins to match
+tmux
+
+# prompt
+starship
+
+# monitoring
+btop
+
+# archives + net
+unzip
+zip
+curl
+wget
+jq
+git
+ca-certificates
+gnupg
+
+# build + language runtime for our own tooling
+build-essential
+python3
+python3-venv
+man-db

@@ -1,0 +1,27 @@
+#!/bin/bash
+
+# omakeb:summary=Lock the session.
+
+# hyprlock is a foreground process that holds the lock for as long as it runs,
+# so a second one launched over the first would stack a redundant surface and
+# leave a stray process behind when the user unlocks. Guard on the running
+# process instead.
+
+set -euo pipefail
+
+notify() {
+  command -v notify-send >/dev/null &&
+    notify-send -a omakeb \
+      -h string:x-canonical-private-synchronous:omakeb-system "$@" || true
+}
+
+if ! command -v hyprlock >/dev/null; then
+  notify "omakeb" "hyprlock is not installed; the session was not locked."
+  exit 1
+fi
+
+if pgrep -x hyprlock >/dev/null 2>&1; then
+  exit 0
+fi
+
+exec hyprlock

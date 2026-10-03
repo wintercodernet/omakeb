@@ -1,0 +1,1380 @@
+#!/bin/bash
+
+# omakeb:summary=Set up, inspect or undo NVIDIA proprietary driver support.
+# omakeb:args=detect|show|enable [--yes] [--no-early-kms]|revert [--yes] [--keep-packages]
+
+# NVIDIA support. Opt-in, never run by install.sh, and reversible.
+#
+# ---------------------------------------------------------------------------
+# READ THIS FIRST: this is the only feature in omakeb that has NEVER been run
+# on the hardware it targets. Everything else was verified on a real machine;
+# there is no NVIDIA card in the project. It is written to be conservative, to
+# refuse rather than guess, and to be undoable from a text console — because
+# the failure mode of getting it wrong is a black screen on a physical box.
+# ---------------------------------------------------------------------------
+#
+# RECOVERY, first, because that is what you need when you are reading this from
+# a phone. After `enable` and a reboot:
+#
+#   Black screen, but Ctrl+Alt+F2 gives you a text console:
+#       the kernel module loaded and the session did not.
+#       log in, then:   omakeb-hw-nvidia revert --yes && sudo reboot
+#
+#   Black screen and NO text console:
+#       the kernel module is the problem. At the GRUB menu press `e`, append
+#       `nomodeset` to the line starting `linux`, boot with Ctrl+X, then run
+#       the revert above. (`nomodeset` gets you a usable console; it is not a
+#       fix, just a way in.)
+#
+#   Doing it by hand, if `omakeb-hw-nvidia` itself will not run:
+#       sudo rm -f /etc/modprobe.d/omakeb-nvidia.conf
+#       sudo nano /etc/initramfs-tools/modules     # delete the omakeb block
+#       sudo update-initramfs -u
+#       rm -f ~/.config/hypr/nvidia.conf           # and its `source =` line in
+#                                                  # ~/.config/omakeb/hyprland.conf
+#       sudo apt purge nvidia-driver               # optional; back to nouveau
+#
+# --- the four facts this is built on ----------------------------------------
+#
+#   1. Debian trixie ships nvidia-driver 550.163.01 in `non-free`, and
+#      `nvidia-detect` in the same component. nvidia-detect inspects the card
+#      and prints the package name to install, including for legacy cards that
+#      need an older series. We run it rather than carrying our own map from
+#      PCI id to driver generation: that map is exactly the thing that rots.
+#      If it recommends nothing we can parse, we stop. We do not fall back to
+#      "probably nvidia-driver".
+#
+#   2. No Debian nvidia package ships anything in /etc/modprobe.d. Checked
+#      against the file lists of nvidia-driver, nvidia-kernel-dkms and
+#      nvidia-kernel-common. So DRM kernel modesetting is NOT on by default,
+#      and that single missing option is the usual cause of a black Wayland
+#      session. We write it ourselves.
+#
+#   3. `fbdev=1` is needed as well as `modeset=1`. Hyprland's wiki says fbdev
+#      became automatic in driver 570.86.16; trixie has 550, which is below
+#      that. The parameter exists from 545, so 550 accepts it — but we verify
+#      with `modinfo` after installing rather than trusting the version
+#      number, and drop any parameter the built module does not declare. A
+#      module that refuses to load because of an unknown parameter is a black
+#      screen.
+#
+#   4. Hyprland's CURRENT guidance is exactly two environment variables:
+#      LIBVA_DRIVER_NAME=nvidia and __GLX_VENDOR_LIBRARY_NAME=nvidia.
+#      GBM_BACKEND=nvidia-drm is NOT in it any more and is deliberately absent
+#      below; the tutorials that still set it predate the eglstreams removal.
+#      NVD_BACKEND=direct belongs to the separate nvidia-vaapi-driver package,
+#      which we do not install, so it is not set either.
+#
+# --- what it refuses to do --------------------------------------------------
+#
+#   * Secure Boot enabled. DKMS builds an unsigned module; the kernel will not
+#     load it; you get a black screen with no warning anywhere. Enrolling a MOK
+#     is a real solution but it is an interactive firmware ritual with its own
+#     ways to brick a boot, and doing it on the user's behalf from a script is
+#     not something we are willing to get wrong sight-unseen.
+#
+#   * Optimus. Specifically: a PORTABLE with an Intel or AMD display controller
+#     alongside the NVIDIA one, or any machine where every connected output
+#     belongs to the other GPU. Both want PRIME render offload — a different
+#     setup with different packages, a different modprobe configuration and
+#     per-application launch variables. Half-doing it produces a laptop that
+#     boots to nothing. We say so and stop.
+#
+#     A second display controller ALONE is not a refusal any more. A desktop
+#     tower with the CPU's integrated graphics enabled in BIOS and the monitor
+#     in the NVIDIA card is the commonest configuration there is, and it is not
+#     Optimus. See graphics_topology().
+#
+#   * No NVIDIA display controller at all.
+#
+# --- where the Hyprland env goes, and why -----------------------------------
+#
+# hyprlang has no conditionals, so `default/hypr/hyprland.conf.in` cannot
+# source an NVIDIA file "only if present": hyprlang treats a missing `source =`
+# target as a config ERROR, and 60-config.sh (which renders that file on every
+# machine) would have to create a stub everywhere for it to be safe. That
+# trades a black screen on NVIDIA machines for a broken config on all of them.
+#
+# So `enable` does it the other way round: it generates ~/.config/hypr/nvidia.conf
+# and adds a three-line marked block to ~/.config/omakeb/hyprland.conf, which
+# hyprland.conf.in already sources LAST. That file belongs to the user, so we
+# only ever append a delimited block and `revert` removes exactly that block —
+# nothing the user wrote is touched. The values live in the generated file, so
+# changing them later never has to re-edit the user's file again.
+#
+# shellcheck shell=bash
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+# --- constants ----------------------------------------------------------------
+
+# Every sysfs read below goes through this. Empty in real use; the tests point
+# it at a fixture tree, which is the only way to exercise a laptop's topology
+# from a machine that is not one.
+SYSFS="${OMAKEB_SYSFS_ROOT:-}"
+
+NV_VENDOR=0x10de
+INTEL_VENDOR=0x8086
+AMD_VENDOR=0x1002
+
+MODPROBE_FILE=/etc/modprobe.d/omakeb-nvidia.conf
+INITRAMFS_MODULES=/etc/initramfs-tools/modules
+# The names NVIDIA's own documentation uses. Correct on a distribution that
+# builds modules under them, and a fallback here — see early_kms_modules().
+EARLY_KMS_FALLBACK="nvidia nvidia_modeset nvidia_uvm nvidia_drm"
+
+# Overridable so the tests can point it at a fixture tree.
+DKMS_MODULE_DIR="${OMAKEB_DKMS_DIR:-}"
+
+MARK_BEGIN='# >>> omakeb-hw-nvidia >>>'
+MARK_END='# <<< omakeb-hw-nvidia <<<'
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+HYPR_ENV_FILE="$CONFIG_HOME/hypr/nvidia.conf"
+USER_HYPR_CONF="$OMAKEB_CONFIG/hyprland.conf"
+
+STATE_DIR="$OMAKEB_STATE/hw-nvidia"
+
+# omakeb-gl-fallback caches whether this machine needs software OpenGL. Both
+# `enable` and `revert` swap the GL stack underneath that answer — the classic
+# case is a first login on nouveau that measured "software", which would
+# otherwise keep a working NVIDIA card on llvmpipe after enable, silently. The
+# cache keys itself on the kernel and DRM driver names too, but deleting it here
+# does not depend on either having changed yet: the next login re-probes.
+GL_MODE_FILE="$OMAKEB_STATE/gl-mode"
+gl_mode_cache_clear() {
+  [[ -e $GL_MODE_FILE ]] || return 0
+  rm -f "$GL_MODE_FILE"
+  log_ok "cleared the cached GL mode; the next login re-probes it"
+}
+
+opt_yes=
+opt_early_kms=1
+opt_keep_packages=
+opt_accept_unknown_sb=
+
+# --- PCI enumeration ----------------------------------------------------------
+#
+# sysfs first so this works on a netinst with no pciutils installed, which is
+# the normal state of a machine that has not run install.sh yet. Display
+# controllers are PCI class 0x03xx — 0x0300 VGA, 0x0302 "3D controller", which
+# is what a discrete GPU in a hybrid laptop usually reports. Both matter.
+#
+# Prints one line per display controller: <slot> <vendor-id> <class>
+
+pci_display_devices() {
+  local dev vendor class found=
+
+  if [[ -d $SYSFS/sys/bus/pci/devices ]]; then
+    for dev in "$SYSFS"/sys/bus/pci/devices/*; do
+      [[ -r "$dev/class" && -r "$dev/vendor" ]] || continue
+      class=$(cat "$dev/class" 2>/dev/null || true)
+      vendor=$(cat "$dev/vendor" 2>/dev/null || true)
+      case "$class" in
+        0x03*) ;;
+        *) continue ;;
+      esac
+      printf '%s %s %s\n' "$(basename "$dev")" "$vendor" "$class"
+      found=1
+    done
+  fi
+  [[ -n $found ]] && return 0
+
+  # Fallback for anything that hides sysfs (a container, an unusual kernel).
+  command -v lspci >/dev/null 2>&1 || return 0
+  lspci -n 2>/dev/null | awk '$2 ~ /^03/ {
+    split($3, id, ":")
+    printf "%s 0x%s 0x%s\n", $1, id[1], substr($2, 1, 4)
+  }' || true
+}
+
+# Human-readable, for the report only. Never parsed.
+pci_display_names() {
+  command -v lspci >/dev/null 2>&1 || return 0
+  lspci -nn 2>/dev/null | grep -E '(VGA compatible controller|3D controller|Display controller)' || true
+}
+
+has_display_vendor() {
+  pci_display_devices | awk -v v="$1" '$2 == v { found = 1 } END { exit !found }'
+}
+
+# --- telling a laptop from a desktop ------------------------------------------
+#
+# This is what the hybrid-graphics refusal now turns on, so it has to be right
+# in both directions. Saying "laptop" on a desktop refuses a setup that would
+# have worked; saying "desktop" on a laptop installs the driver on the one shape
+# of machine where that reliably produces a black internal panel.
+
+is_portable_chassis() {
+  local bat lid t
+
+  # A battery is the most reliable signal available: laptops have one and towers
+  # do not. A UPS enumerates as a "UPS" power supply, not BAT*.
+  for bat in "$SYSFS"/sys/class/power_supply/BAT*; do
+    [[ -e $bat ]] && return 0
+  done
+
+  # For a laptop running with the battery removed. SMBIOS 3.x table 7.4.1:
+  # 8 Portable, 9 Laptop, 10 Notebook, 11 Hand Held, 14 Sub Notebook,
+  # 30 Tablet, 31 Convertible, 32 Detachable. Deliberately NOT 12 (Docking
+  # Station) or 13 (All In One), neither of which is an Optimus shape.
+  t=$(cat "$SYSFS"/sys/class/dmi/id/chassis_type 2>/dev/null || true)
+  case "$t" in
+    8 | 9 | 10 | 11 | 14 | 30 | 31 | 32) return 0 ;;
+  esac
+
+  # Globbed to a real device rather than testing the directory: on some desktops
+  # /proc/acpi/button/lid exists and is empty, and `-d` alone would call a tower
+  # a laptop.
+  for lid in "$SYSFS"/proc/acpi/button/lid/*/state; do
+    [[ -e $lid ]] && return 0
+  done
+
+  return 1
+}
+
+# True when a display is actually plugged into a GPU of this vendor.
+#
+# The connector carries the status; the PCI vendor lives on the card it belongs
+# to. /sys/class/drm/card1-DP-4/status is the connector,
+# /sys/class/drm/card1/device/vendor is the card.
+vendor_has_connected_output() {
+  local want=$1 conn base card vendor
+  for conn in "$SYSFS"/sys/class/drm/card*-*; do
+    [[ -r "$conn/status" ]] || continue
+    [[ "$(cat "$conn/status" 2>/dev/null || true)" == connected ]] || continue
+    base=${conn##*/}
+    card=${base%%-*}
+    vendor=$(cat "$SYSFS/sys/class/drm/$card/device/vendor" 2>/dev/null || true)
+    [[ $vendor == "$want" ]] && return 0
+  done
+  return 1
+}
+
+# The whole hybrid question, as one word. Kept separate from cmd_enable so the
+# tests can drive it from a fixture tree instead of the machine they run on.
+#
+#   single   only NVIDIA display controllers; nothing to decide
+#   optimus  a portable with a second display controller — PRIME territory
+#   offload  a desktop with a second controller and the display demonstrably on
+#            the OTHER GPU, so the driver alone would drive nothing
+#   discrete a desktop with a second controller and the display on the NVIDIA
+#            card — an ordinary tower with the iGPU left enabled in BIOS
+#   unknown  two controllers and nothing connected anywhere we can see
+#
+# `offload` requires POSITIVE evidence — some other vendor actually holding a
+# connected output. Inferring it from "the NVIDIA card has no connectors" is
+# wrong, and wrong in a way that bites precisely here: a card whose driver is
+# installed but has modeset off exposes no connectors at all, which is the state
+# this machine is in for the entire window between `enable` and the reboot that
+# finishes it. Read that as `offload` and the command refuses to fix the problem
+# it just diagnosed. (Observed: the second `enable` run on the test machine
+# refused for this reason, with the monitor plugged into the NVIDIA card the
+# whole time.)
+graphics_topology() {
+  if ! has_display_vendor "$INTEL_VENDOR" && ! has_display_vendor "$AMD_VENDOR"; then
+    printf 'single\n'; return 0
+  fi
+  if is_portable_chassis; then
+    printf 'optimus\n'; return 0
+  fi
+  if vendor_has_connected_output "$NV_VENDOR"; then
+    printf 'discrete\n'; return 0
+  fi
+  if vendor_has_connected_output "$INTEL_VENDOR" || vendor_has_connected_output "$AMD_VENDOR"; then
+    printf 'offload\n'; return 0
+  fi
+  printf 'unknown\n'
+}
+
+# --- Secure Boot --------------------------------------------------------------
+#
+# Sets SB_STATE to enabled | disabled | unknown, and leaves the evidence in
+# SB_REASON. "unknown" is never treated as "disabled" — see enable().
+#
+# Both are globals, and the state is NOT echoed. The callers used to run this in
+# a command substitution, which is a subshell: every SB_REASON it set was thrown
+# away on return, so the reason printed blank at every call site — including the
+# refusal that fires when Secure Boot is ON, which is the one message whose
+# entire job is to say how we concluded that.
+#
+# mokutil is authoritative but is not installed on a netinst, so there are two
+# fallbacks. The legacy-BIOS one is a genuine determination, not a guess: with
+# no /sys/firmware/efi the machine did not boot via UEFI and Secure Boot cannot
+# be active at all.
+
+SB_REASON=
+SB_STATE=
+
+secure_boot_state() {
+  local out var val
+
+  if command -v mokutil >/dev/null 2>&1; then
+    out=$(mokutil --sb-state 2>&1 || true)
+    case "$out" in
+      *"SecureBoot enabled"*)
+        SB_REASON="mokutil --sb-state: SecureBoot enabled"; SB_STATE=enabled; return 0 ;;
+      *"SecureBoot disabled"*)
+        SB_REASON="mokutil --sb-state: SecureBoot disabled"; SB_STATE=disabled; return 0 ;;
+      *"not supported"*|*"EFI variables are not supported"*)
+        SB_REASON="mokutil: this system did not boot via UEFI, so Secure Boot cannot be active"
+        SB_STATE=disabled; return 0 ;;
+    esac
+    SB_REASON="mokutil --sb-state was unreadable: ${out:-no output}"
+  fi
+
+  if [[ ! -d /sys/firmware/efi ]]; then
+    SB_REASON="no /sys/firmware/efi, so this machine booted in legacy BIOS mode and Secure Boot cannot be active"
+    SB_STATE=disabled; return 0
+  fi
+
+  # efivarfs prefixes the value with four attribute bytes; the fifth is the flag.
+  var=/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c
+  if [[ -r $var ]]; then
+    val=$(od -An -tu1 -j4 -N1 "$var" 2>/dev/null | tr -d '[:space:]' || true)
+    case "$val" in
+      1) SB_REASON="EFI variable SecureBoot = 1"; SB_STATE=enabled; return 0 ;;
+      0) SB_REASON="EFI variable SecureBoot = 0"; SB_STATE=disabled; return 0 ;;
+    esac
+  fi
+
+  SB_REASON="${SB_REASON:-could not read the SecureBoot EFI variable and mokutil is not installed}"
+  SB_STATE=unknown
+}
+
+# --- nouveau blacklisting -----------------------------------------------------
+#
+# Reported rather than acted on, because it decides how bad a failed DKMS build
+# is. If nothing blacklists nouveau, a driver that fails to build leaves you
+# with the open driver and a working, slow desktop. If something does, the same
+# failure is a black screen. We never write a blacklist ourselves.
+
+nouveau_blacklisted_by() {
+  # -R, not -r. Debian's own blacklist is
+  # /etc/modprobe.d/nvidia-blacklists-nouveau.conf, which is a SYMLINK into
+  # /etc/alternatives — and `grep -r` does not follow symlinks it meets while
+  # recursing. With -r this function returned nothing on the one distribution
+  # this command targets, so the "nouveau is blacklisted, so rebooting now is
+  # likely to give you a black screen" warning could never fire, at the exact
+  # moment it is the only thing standing between the user and that black screen.
+  grep -RlsE '^[[:space:]]*blacklist[[:space:]]+nouveau' \
+    /etc/modprobe.d /lib/modprobe.d /usr/lib/modprobe.d 2>/dev/null || true
+}
+
+# --- file bodies --------------------------------------------------------------
+#
+# Kept as functions so `show` can print exactly what `enable` would write, and
+# so test/lint-nvidia.sh can assert on the real content instead of a copy.
+
+# $1 (optional): space-separated list of parameters the built module actually
+# declares. Empty means "not verified yet", which is what `show` prints.
+modprobe_body() {
+  local params=${1:-}
+  local opts="modeset=1"
+  if [[ -z $params ]] || [[ " $params " == *" fbdev "* ]]; then
+    opts="$opts fbdev=1"
+  fi
+  local real
+  real=$(nvidia_drm_module_name 2>/dev/null || true)
+
+  cat <<BODY
+# Managed by omakeb (omakeb-hw-nvidia). Delete this file to undo it.
+#
+# No Debian nvidia package ships anything in /etc/modprobe.d, so nothing turns
+# DRM kernel modesetting on by itself. Without modeset=1 a Wayland compositor
+# gets no usable DRM device and the session is a black screen.
+#
+# fbdev=1 hands the framebuffer console to the driver as well. It became the
+# default in 570.86.16; trixie ships 550, so it is set explicitly. It is only
+# written here when modinfo confirms the built module declares it.
+options nvidia_drm $opts
+BODY
+
+  # An `options` line is keyed on the name the module is REQUESTED by, not on
+  # the name it reports once loaded. Debian's file is nvidia-current-drm.ko and
+  # `options nvidia_drm` reaches it only through the `install nvidia_drm ...`
+  # indirection in /etc/modprobe.d/nvidia.conf — which udev's load-by-alias goes
+  # through and a direct load does not.
+  #
+  # Early KMS is a direct load: /etc/initramfs-tools/modules has to name the
+  # built files for initramfs-tools to find them at all, so the initramfs asks
+  # for nvidia-current-drm and the line above never matches. That boots to
+  # modeset=N, no connectors, and a compositor with no usable DRM device — the
+  # exact failure this file exists to prevent, arrived at by fixing early KMS.
+  #
+  # So write the line for both names. Whichever way the module is reached, the
+  # options are there.
+  if [[ -n $real && $real != nvidia_drm ]]; then
+    printf '\n%s\n%s\n' \
+      "# The same options under the name the initramfs loads it by." \
+      "options $real $opts"
+  fi
+}
+
+initramfs_block_body() {
+  local m
+  printf '%s\n' "$MARK_BEGIN"
+  printf '%s\n' "# Early KMS: load the NVIDIA modules from the initramfs so the mode is set"
+  printf '%s\n' "# before userspace starts. Removes the flicker and the brief console at boot."
+  printf '%s\n' "# Known cost: early KMS can break resume from hibernation on some machines."
+  printf '%s\n' "# If hibernate stops resuming, delete this block and run: sudo update-initramfs -u"
+  for m in $(early_kms_modules); do printf '%s\n' "$m"; done
+  printf '%s\n' "$MARK_END"
+}
+
+# hyprlang truncates every line at an unescaped '#', so no value below may
+# contain one. test/lint-nvidia.sh asserts that.
+hypr_env_body() {
+  cat <<'BODY'
+# Managed by omakeb (omakeb-hw-nvidia). Rewritten by `enable`, deleted by
+# `revert`. Sourced from ~/.config/omakeb/hyprland.conf, which Hyprland reads
+# last, so these win.
+#
+# These two are Hyprland's current NVIDIA recommendation, in full.
+#
+# Deliberately NOT set:
+#   GBM_BACKEND=nvidia-drm   no longer in Hyprland's guidance. It was needed
+#                            back when the alternative was EGLStreams; setting
+#                            it today is at best inert and at worst breaks
+#                            buffer allocation on a hybrid setup.
+#   NVD_BACKEND=direct       belongs to the separate nvidia-vaapi-driver
+#                            package, which omakeb does not install. If you
+#                            install it yourself, that is where to add it.
+#
+# hyprlang truncates a line at an unescaped hash, so no value here contains one.
+env = LIBVA_DRIVER_NAME,nvidia
+env = __GLX_VENDOR_LIBRARY_NAME,nvidia
+BODY
+}
+
+hypr_source_block_body() {
+  printf '%s\n' "$MARK_BEGIN"
+  printf '%s\n' "# Added by omakeb-hw-nvidia. Remove with: omakeb-hw-nvidia revert"
+  printf '%s\n' "source = $HYPR_ENV_FILE"
+  printf '%s\n' "$MARK_END"
+}
+
+# --- marked blocks in files we do not own -------------------------------------
+#
+# Both the user's hyprland.conf and /etc/initramfs-tools/modules belong to
+# somebody else, so we only ever add or remove a delimited block and never
+# rewrite the file wholesale. Idempotent: re-running enable is a no-op.
+
+block_strip() {
+  awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
+    $0 == b { skip = 1 }
+    !skip   { print }
+    $0 == e { skip = 0 }
+  ' "$1"
+}
+
+# block_set <file> <sudo|user>   body on stdin
+block_set() {
+  local file=$1 mode=$2 body current new tmp
+  body=$(cat)
+
+  if [[ $mode == sudo ]]; then
+    sudo test -f "$file" || sudo install -D -m 0644 /dev/null "$file"
+    current=$(sudo cat "$file")
+    new=$(printf '%s\n' "$current" | block_strip /dev/stdin)
+  else
+    if [[ ! -f $file ]]; then
+      mkdir -p "$(dirname "$file")"
+      : > "$file"
+      log_warn "created $file, which install/60-config.sh normally seeds"
+    fi
+    current=$(cat "$file")
+    new=$(block_strip "$file")
+  fi
+
+  new=$(printf '%s\n%s\n' "$new" "$body")
+  if [[ $new == "$current" ]]; then
+    log_skip "unchanged: $file"
+    return 0
+  fi
+
+  tmp=$(mktemp)
+  printf '%s\n' "$new" > "$tmp"
+  if [[ $mode == sudo ]]; then
+    sudo install -D -m 0644 "$tmp" "$file"
+  else
+    install -m 0644 "$tmp" "$file"
+  fi
+  rm -f "$tmp"
+  log_ok "added the omakeb-hw-nvidia block to $file"
+}
+
+# block_clear <file> <sudo|user>
+block_clear() {
+  local file=$1 mode=$2 current new tmp
+  if [[ $mode == sudo ]]; then
+    sudo test -f "$file" || { log_skip "not present: $file"; return 0; }
+    current=$(sudo cat "$file")
+  else
+    [[ -f $file ]] || { log_skip "not present: $file"; return 0; }
+    current=$(cat "$file")
+  fi
+
+  new=$(printf '%s\n' "$current" | block_strip /dev/stdin)
+  if [[ $new == "$current" ]]; then
+    log_skip "no omakeb-hw-nvidia block in $file"
+    return 0
+  fi
+
+  tmp=$(mktemp)
+  printf '%s\n' "$new" > "$tmp"
+  if [[ $mode == sudo ]]; then
+    sudo install -D -m 0644 "$tmp" "$file"
+  else
+    install -m 0644 "$tmp" "$file"
+  fi
+  rm -f "$tmp"
+  log_ok "removed the omakeb-hw-nvidia block from $file"
+}
+
+# --- packages -----------------------------------------------------------------
+
+# What nvidia-detect recommends, one package per line. Empty output means we
+# could not read an answer out of it, which is a stop condition, not a cue to
+# guess a driver name.
+nvidia_detect_packages() {
+  nvidia-detect 2>/dev/null | awk '
+    /recommended to install the/            { grab = 1; next }
+    grab && /^[[:space:]]*$/                { grab = 0; next }
+    grab && /^[[:space:]]*packages?\.?[[:space:]]*$/ { grab = 0; next }
+    grab {
+      line = $0
+      gsub(/^[[:space:]]+/, "", line)
+      gsub(/[[:space:]]+$/, "", line)
+      if (line ~ /^[a-z0-9][a-z0-9.+-]*$/) print line
+    }
+  ' || true
+}
+
+# DKMS needs headers for the running kernel AND for every kernel installed
+# later, which is what the metapackage buys over the exact one. Derived from
+# dpkg, never hardcoded (D9): linux-headers-<arch> is a real metapackage on the
+# architectures the NVIDIA driver exists for, and the exact-version fallback
+# covers a machine whose kernel came from somewhere else.
+headers_package() {
+  local meta exact
+  meta="linux-headers-$(arch_dpkg)"
+  if pkg_has_candidate "$meta"; then
+    echo "$meta"
+    return 0
+  fi
+  exact="linux-headers-$(uname -r)"
+  if pkg_has_candidate "$exact"; then
+    echo "$exact"
+    return 0
+  fi
+  return 1
+}
+
+# modinfo is in /usr/sbin, which is NOT on an ordinary user's PATH on trixie
+# (the /usr/sbin merge lands after this release). Looking it up by bare name
+# would silently report "the module did not build" for every non-root caller,
+# which is exactly the wrong answer to give at that point.
+modinfo_bin() {
+  local p
+  for p in modinfo /usr/sbin/modinfo /sbin/modinfo /usr/bin/modinfo; do
+    if command -v "$p" >/dev/null 2>&1; then echo "$p"; return 0; fi
+  done
+  return 1
+}
+
+# What the DRM module is actually CALLED here.
+#
+# `nvidia_drm` is the name every NVIDIA document uses, and it is not the name of
+# a file on Debian. Debian builds flavoured modules — nvidia-current-drm for the
+# default driver, nvidia-tesla-470-drm for the legacy one — and bridges the gap
+# with `install nvidia_drm ... modprobe -i nvidia-current-drm` rules in
+# /etc/modprobe.d/nvidia.conf. modprobe honours those; modinfo does not.
+#
+# So `modinfo nvidia_drm` finds nothing on a Debian machine where the build
+# succeeded perfectly. That misreport is expensive: it is what both the "the
+# DKMS build probably failed" warning and the early-KMS skip hang off, so a
+# correct install told the user to go read a make.log and quietly dropped the
+# early KMS it had just promised.
+#
+# Prefer the plain name, for distributions that use it; otherwise hand modinfo
+# the file that was actually built for the running kernel, which needs no name.
+nvidia_drm_module() {
+  local mi f
+  mi=$(modinfo_bin) || return 1
+  if "$mi" nvidia_drm >/dev/null 2>&1; then
+    printf 'nvidia_drm\n'
+    return 0
+  fi
+  f=$(find "/lib/modules/$(uname -r)" -name 'nvidia*drm.ko*' -print -quit 2>/dev/null)
+  [[ -n $f ]] || return 1
+  printf '%s\n' "$f"
+}
+
+# The DRM module's real name, as a name — nvidia-current-drm on Debian's default
+# flavour, nvidia_drm where the documented name is also the file.
+#
+# Distinct from nvidia_drm_module(), which may hand back a PATH for modinfo to
+# read. This one has to be a name, because it is what `options` lines are keyed
+# on.
+nvidia_drm_module_name() {
+  local dir=${DKMS_MODULE_DIR:-/lib/modules/$(uname -r)/updates/dkms}
+  local f b
+  for f in "$dir"/nvidia*-drm.ko*; do
+    [[ -e $f ]] || continue
+    b=${f##*/}
+    printf '%s\n' "${b%%.ko*}"
+    return 0
+  done
+  return 1
+}
+
+# The modules early KMS should load, under names initramfs-tools can resolve.
+#
+# /etc/initramfs-tools/modules is a list of module NAMES, and initramfs-tools
+# looks each one up as a FILE. It does not follow modprobe `install` rules. So
+# the documented names — nvidia, nvidia_modeset, nvidia_uvm, nvidia_drm — work
+# for modprobe and match nothing at all at initramfs build time on Debian, whose
+# files are nvidia-current*.ko.
+#
+# The failure was completely silent: the block was written, update-initramfs ran
+# and reported success, and not one NVIDIA module went into the image. Only
+# `lsinitramfs | grep nvidia` showed it, and what that turns up on a machine
+# with no early KMS at all is forcedeth and typec_nvidia, which look reassuring
+# until you read them.
+#
+# So name the files that were actually built. Base first, then modeset, uvm and
+# drm — the order they depend on each other in.
+early_kms_modules() {
+  local dir=${DKMS_MODULE_DIR:-/lib/modules/$(uname -r)/updates/dkms}
+  local base= f b m
+  local -a out=()
+
+  for f in "$dir"/nvidia*.ko*; do
+    [[ -e $f ]] || continue
+    b=${f##*/}
+    b=${b%%.ko*}
+    case "$b" in
+      *-modeset | *-uvm | *-drm | *-peermem) ;;
+      *) base=$b ;;
+    esac
+  done
+
+  # Nothing flavoured here: either another distribution's layout, or no build.
+  # The documented names are the best guess available and are what this always
+  # used to write.
+  if [[ -z $base ]]; then
+    printf '%s\n' "$EARLY_KMS_FALLBACK"
+    return 0
+  fi
+
+  out=("$base")
+  for m in modeset uvm drm; do
+    for f in "$dir/$base-$m".ko*; do
+      [[ -e $f ]] && { out+=("$base-$m"); break; }
+    done
+  done
+  printf '%s\n' "${out[*]}"
+}
+
+# Which parameters the built module actually declares. Empty means either that
+# the module is not there or that modinfo is not, and the caller distinguishes
+# the two — "cannot tell" must not be reported as "did not build".
+nvidia_drm_params() {
+  local mi target
+  mi=$(modinfo_bin) || return 0
+  target=$(nvidia_drm_module) || return 0
+  "$mi" "$target" 2>/dev/null | sed -n 's/^parm:[[:space:]]*\([a-zA-Z0-9_]*\).*/\1/p' | tr '\n' ' ' || true
+}
+
+# Packages left behind after purging the top-level ones: nvidia-driver is a
+# metapackage, and purging it alone leaves nvidia-kernel-dkms installed and
+# still building a module on every kernel upgrade — which is not "reverted".
+#
+# Restricted to packages apt itself marks as automatically installed, so a
+# CUDA toolkit or anything else the user chose deliberately is never caught.
+nvidia_leftovers() {
+  local installed auto
+  installed=$(dpkg-query -W -f='${db:Status-Status}\t${binary:Package}\n' \
+                'nvidia*' 'libnvidia*' 'xserver-xorg-video-nvidia*' 2>/dev/null \
+              | awk -F'\t' '$1 == "installed" { sub(/:.*/, "", $2); print $2 }' \
+              | sort -u) || true
+  [[ -n ${installed:-} ]] || return 0
+  auto=$(apt-mark showauto 2>/dev/null | sort -u) || true
+  [[ -n ${auto:-} ]] || return 0
+  printf '%s\n' "$installed" | grep -Fxf <(printf '%s\n' "$auto") || true
+}
+
+# --- report -------------------------------------------------------------------
+
+cmd_detect() {
+  local devs sb blacklist names
+
+  log_step "Graphics hardware"
+  devs=$(pci_display_devices)
+  if [[ -z $devs ]]; then
+    log_warn "no PCI display controller found (and no lspci to ask)"
+  else
+    printf '%s\n' "$devs" | while read -r slot vendor class; do
+      case "$vendor" in
+        "$NV_VENDOR")    log_info "$slot  NVIDIA          vendor $vendor class $class" ;;
+        "$INTEL_VENDOR") log_info "$slot  Intel           vendor $vendor class $class" ;;
+        "$AMD_VENDOR")   log_info "$slot  AMD/ATI         vendor $vendor class $class" ;;
+        *)               log_info "$slot  other           vendor $vendor class $class" ;;
+      esac
+    done
+  fi
+  names=$(pci_display_names)
+  if [[ -n $names ]]; then
+    log_info ""
+    printf '%s\n' "$names" | while read -r line; do log_info "  $line"; done
+  fi
+
+  log_step "Verdict"
+  if ! has_display_vendor "$NV_VENDOR"; then
+    log_info "No NVIDIA display controller. Nothing to do here."
+    return 0
+  fi
+  log_ok "NVIDIA display controller present"
+
+  case "$(graphics_topology)" in
+    single)
+      log_ok "Single-GPU machine: no integrated display controller alongside it."
+      ;;
+    discrete)
+      log_ok "An integrated GPU is present, but your display is on the NVIDIA card."
+      log_info "That is an ordinary desktop, not Optimus, so 'enable' will proceed."
+      ;;
+    optimus)
+      log_warn "Hybrid graphics on a portable: an integrated GPU alongside the NVIDIA one."
+      log_info "This is Optimus. It needs PRIME render offload, which omakeb does not"
+      log_info "implement, so 'enable' will refuse."
+      ;;
+    unknown)
+      log_warn "Two display controllers, and no connected output visible on either."
+      log_info "That is also what an installed driver with modeset still off looks"
+      log_info "like, so 'enable' proceeds and assumes the NVIDIA card."
+      ;;
+    offload)
+      log_warn "Two display controllers, and nothing is plugged into the NVIDIA one."
+      log_info "'enable' will refuse: the driver would leave that card driving nothing."
+      log_info "On a desktop, moving the monitor to the NVIDIA card's own output fixes it."
+      ;;
+  esac
+
+  secure_boot_state
+  sb=$SB_STATE
+  case "$sb" in
+    enabled)  log_warn "Secure Boot: ENABLED — $SB_REASON" ;;
+    disabled) log_ok   "Secure Boot: disabled — $SB_REASON" ;;
+    *)        log_warn "Secure Boot: UNKNOWN — $SB_REASON" ;;
+  esac
+
+  log_step "Current state"
+  if command -v nvidia-detect >/dev/null 2>&1; then
+    local rec
+    rec=$(nvidia_detect_packages | tr '\n' ' ')
+    if [[ -n ${rec// /} ]]; then
+      log_ok "nvidia-detect recommends: $rec"
+    else
+      log_warn "nvidia-detect is installed but its recommendation could not be parsed"
+      log_info "Run 'nvidia-detect' by hand and read it yourself."
+    fi
+  else
+    log_info "nvidia-detect is not installed, so the exact driver package is not known yet"
+  fi
+
+  if pkg_installed nvidia-driver 2>/dev/null; then
+    log_info "nvidia-driver: installed"
+  else
+    log_info "nvidia-driver: not installed"
+  fi
+
+  local params
+  params=$(nvidia_drm_params)
+  if [[ -n ${params// /} ]]; then
+    log_ok "nvidia_drm module is built and declares: $params"
+  else
+    log_info "nvidia_drm module is not present (expected, if the driver is not installed)"
+  fi
+
+  if [[ -f $MODPROBE_FILE ]]; then
+    log_ok "$MODPROBE_FILE exists:"
+    sed -n 's/^options/  options/p' "$MODPROBE_FILE" | while read -r line; do log_info "$line"; done
+  else
+    log_info "$MODPROBE_FILE is absent, so DRM modesetting is off"
+  fi
+
+  [[ -f $HYPR_ENV_FILE ]] &&
+    log_ok "$HYPR_ENV_FILE exists" ||
+    log_info "$HYPR_ENV_FILE is absent"
+
+  blacklist=$(nouveau_blacklisted_by)
+  if [[ -n $blacklist ]]; then
+    log_warn "nouveau is blacklisted by: $(printf '%s ' $blacklist)"
+    log_info "That means a failed nvidia module leaves NO working driver at all."
+  else
+    log_info "nothing blacklists nouveau, so it remains as a fallback"
+  fi
+
+  log_step "Next"
+  log_info "This command changed nothing. To see the exact files that would be"
+  log_info "written:            omakeb-hw-nvidia show"
+  log_info "To do the setup:    omakeb-hw-nvidia enable"
+}
+
+cmd_show() {
+  log_step "$MODPROBE_FILE"
+  log_info "(fbdev=1 is dropped at enable time if modinfo says the built module"
+  log_info " does not declare it)"
+  echo
+  modprobe_body | sed 's/^/    /'
+
+  echo
+  log_step "$INITRAMFS_MODULES — appended as a marked block, unless --no-early-kms"
+  echo
+  initramfs_block_body | sed 's/^/    /'
+
+  echo
+  log_step "$HYPR_ENV_FILE — written whole"
+  echo
+  hypr_env_body | sed 's/^/    /'
+
+  echo
+  log_step "$USER_HYPR_CONF — appended as a marked block"
+  echo
+  hypr_source_block_body | sed 's/^/    /'
+
+  echo
+  log_step "Also"
+  log_info "apt components contrib and non-free enabled via"
+  log_info "  $OMAKEB_COMPONENTS_SOURCE"
+  log_info "packages: nvidia-detect, whatever nvidia-detect recommends, and kernel headers"
+  log_info "commands: sudo update-initramfs -u"
+}
+
+# --- enable -------------------------------------------------------------------
+
+refuse() {
+  log_error "$1"
+  shift
+  local line
+  for line in "$@"; do log_info "$line"; done
+  log_info ""
+  log_info "Nothing was changed."
+  exit 1
+}
+
+cmd_enable() {
+  local sb recommended headers params blacklist pkgs
+
+  # ---- refusals, before anything is touched ----------------------------------
+
+  log_step "Checking this machine"
+
+  has_display_vendor "$NV_VENDOR" || refuse \
+    "no NVIDIA display controller found on this machine." \
+    "Checked every PCI device of class 0x03xx for vendor $NV_VENDOR." \
+    "Run 'omakeb-hw-nvidia detect' to see what is actually here."
+  log_ok "NVIDIA display controller present"
+
+  # A second display controller used to be an outright refusal. That was right
+  # for the machine it was written against and wrong for the commonest desktop
+  # there is: a tower with the CPU's integrated graphics left enabled in BIOS
+  # and the monitor plugged into the NVIDIA card. Nothing about that is Optimus,
+  # and refusing it sent people to a wiki page for a problem they do not have.
+  #
+  # What actually decides it is whether the NVIDIA GPU can drive the display
+  # itself. If it can, the plain driver setup is the correct one. If it cannot,
+  # you need PRIME, which omakeb does not implement.
+  case "$(graphics_topology)" in
+    single)
+      log_ok "single-GPU machine (no integrated display controller alongside it)"
+      ;;
+    discrete)
+      log_ok "desktop with an integrated GPU present, and your display on the NVIDIA card"
+      ;;
+    optimus)
+      refuse \
+        "this is a laptop with hybrid graphics (integrated GPU + NVIDIA)." \
+        "That is an Optimus setup. Driving it properly means PRIME render offload:" \
+        "different packages, a different modprobe configuration, and per-application" \
+        "environment variables to choose which GPU an app runs on." \
+        "" \
+        "omakeb does not implement PRIME. Installing the driver the way this command" \
+        "otherwise would is a well-known way to end up with a laptop that boots to a" \
+        "black screen, so it stops here rather than doing half of it." \
+        "" \
+        "The integrated GPU is driving your display today and works. If you want" \
+        "offload, the Debian wiki page 'NVIDIA Optimus' is the reference."
+      ;;
+    unknown)
+      # Not a refusal. No connected output anywhere is what a freshly installed
+      # driver with modeset still off looks like, and refusing would strand the
+      # machine one step short of working.
+      log_warn "two display controllers, and no connected output visible on either."
+      log_warn "Assuming the display is on the NVIDIA card. If it is not, run"
+      log_warn "'omakeb-hw-nvidia revert' after the reboot."
+      ;;
+    offload)
+      refuse \
+        "this machine has two display controllers and no display on the NVIDIA one." \
+        "Every connected output belongs to the integrated GPU, so installing the" \
+        "driver would leave the NVIDIA card driving nothing at all." \
+        "" \
+        "On a desktop the fix is usually a cable, not a driver: move the monitor to" \
+        "one of the NVIDIA card's own outputs and run this again." \
+        "" \
+        "Rendering on the NVIDIA card while displaying on the integrated one is" \
+        "PRIME render offload, which omakeb does not implement."
+      ;;
+  esac
+
+  secure_boot_state
+  sb=$SB_STATE
+  case "$sb" in
+    enabled)
+      refuse \
+        "Secure Boot is enabled." \
+        "$SB_REASON" \
+        "" \
+        "DKMS compiles the NVIDIA kernel module on this machine and signs it with" \
+        "nothing. With Secure Boot on, the kernel refuses to load unsigned modules," \
+        "so the driver would install cleanly, report no error, and then not load —" \
+        "which on a Wayland desktop is a black screen with no message anywhere." \
+        "" \
+        "There is a real fix: enrol a Machine Owner Key (mokutil --import) and sign" \
+        "each built module against it. omakeb will not do that for you. It is an" \
+        "interactive firmware ritual, it differs between vendors, and getting it" \
+        "wrong on your machine is not something this script can recover from." \
+        "" \
+        "Either turn Secure Boot off in the firmware setup, or set MOK signing up" \
+        "yourself and re-run this."
+      ;;
+    unknown)
+      if [[ -z $opt_accept_unknown_sb ]]; then
+        refuse \
+          "could not determine whether Secure Boot is enabled." \
+          "$SB_REASON" \
+          "" \
+          "Unknown is not treated as off. If Secure Boot turns out to be on, the" \
+          "module built here will not load and the machine will come up black." \
+          "" \
+          "Install Debian's own tool and re-run, which is the whole fix:" \
+          "    sudo apt install mokutil" \
+          "    omakeb-hw-nvidia enable" \
+          "" \
+          "If you already know Secure Boot is off and just cannot prove it here:" \
+          "    omakeb-hw-nvidia enable --accept-unknown-secure-boot"
+      fi
+      log_warn "Secure Boot state is UNKNOWN and you passed --accept-unknown-secure-boot"
+      log_warn "$SB_REASON"
+      ;;
+    *)
+      log_ok "Secure Boot is off — $SB_REASON"
+      ;;
+  esac
+
+  # ---- the plan --------------------------------------------------------------
+
+  blacklist=$(nouveau_blacklisted_by)
+
+  log_step "What this will change"
+  log_info "apt"
+  log_info "  enable the contrib and non-free components, additively, in"
+  log_info "    $OMAKEB_COMPONENTS_SOURCE"
+  log_info "  install nvidia-detect, the driver package it recommends, and kernel headers"
+  log_info "files"
+  log_info "  write   $MODPROBE_FILE            (options nvidia_drm modeset=1 fbdev=1)"
+  if [[ -n $opt_early_kms ]]; then
+    log_info "  append  $INITRAMFS_MODULES   (a marked block: $(early_kms_modules))"
+  else
+    log_info "  skip    $INITRAMFS_MODULES   (--no-early-kms)"
+  fi
+  log_info "  write   $HYPR_ENV_FILE"
+  log_info "  append  $USER_HYPR_CONF        (three lines, in a marked block)"
+  log_info "commands"
+  log_info "  sudo update-initramfs -u"
+  log_info "state"
+  log_info "  record what was installed in $STATE_DIR, so revert can undo it"
+  log_info ""
+  log_warn "A reboot is required afterwards, and this is the one omakeb feature"
+  log_warn "that has never been tested on real NVIDIA hardware."
+  if [[ -n $opt_early_kms ]]; then
+    log_warn "Early KMS can break resume-from-hibernation on some machines. Pass"
+    log_warn "--no-early-kms to skip it; the desktop works either way."
+  fi
+  if [[ -n $blacklist ]]; then
+    log_warn "nouveau is blacklisted by $(printf '%s ' $blacklist)— if the NVIDIA"
+    log_warn "module fails to build there will be no working driver at all."
+  fi
+  log_info ""
+  log_info "Everything above is undoable with: omakeb-hw-nvidia revert"
+
+  confirm "Proceed?" || { log_info "Nothing was changed."; exit 0; }
+
+  sudo_keepalive_start
+  state_init
+  mkdir -p "$STATE_DIR"
+
+  # ---- apt -------------------------------------------------------------------
+
+  log_step "Debian components"
+  local before after added c
+  # _components_current is lib/apps.sh's own reader; using it rather than a
+  # second parser of the same file is what keeps the two from disagreeing.
+  before=$(_components_current)
+  debian_component_enable contrib non-free
+  after=$(_components_current)
+  added=
+  for c in contrib non-free; do
+    case " $before " in *" $c "*) ;; *) added="$added $c" ;; esac
+  done
+  printf '%s\n' "${added# }" > "$STATE_DIR/components-added"
+
+  # debian_component_enable only refreshes when it actually wrote the file, so
+  # on a re-run the index could be old enough that nvidia-detect looks absent.
+  apt_refresh
+
+  log_step "Asking Debian which driver this card needs"
+  if ! pkg_has_candidate nvidia-detect; then
+    refuse \
+      "nvidia-detect has no installation candidate for $(arch_dpkg)." \
+      "contrib and non-free were just enabled ($after), so either the archive has" \
+      "no NVIDIA packages for this architecture, or apt could not reach the mirror." \
+      "Undo the component change with: omakeb-hw-nvidia revert"
+  fi
+  apt_install nvidia-detect
+
+  recommended=$(nvidia_detect_packages | tr '\n' ' ')
+  recommended=${recommended%% }
+  if [[ -z ${recommended// /} ]]; then
+    refuse \
+      "nvidia-detect did not name a package we could read." \
+      "Its full output was:" \
+      "$(nvidia-detect 2>&1 | sed 's/^/    /')" \
+      "" \
+      "This usually means the card is too old and its driver series has been" \
+      "removed from Debian, or nvidia-detect changed its wording. Either way we" \
+      "will not guess a driver name — installing the wrong series is a black" \
+      "screen. Read the output above and install the package by hand if it names" \
+      "one." \
+      "" \
+      "To undo the apt change made so far: omakeb-hw-nvidia revert"
+  fi
+  log_ok "nvidia-detect recommends: $recommended"
+
+  for c in $recommended; do
+    pkg_has_candidate "$c" || refuse \
+      "nvidia-detect recommends '$c', which apt cannot install." \
+      "There is no candidate for $(arch_dpkg). Stopping rather than substituting" \
+      "something that looks similar." \
+      "To undo the apt change made so far: omakeb-hw-nvidia revert"
+  done
+
+  if ! headers="$(headers_package)"; then
+    refuse \
+      "no kernel headers package is available for this machine." \
+      "DKMS cannot build the NVIDIA module without headers matching the running" \
+      "kernel ($(uname -r)). Tried linux-headers-$(arch_dpkg) and" \
+      "linux-headers-$(uname -r); neither has an apt candidate." \
+      "To undo the apt change made so far: omakeb-hw-nvidia revert"
+  fi
+  log_ok "kernel headers: $headers"
+
+  log_step "Installing"
+  pkgs="$recommended $headers"
+  # Recorded BEFORE the install, not after: if apt dies halfway the machine has
+  # packages on it that revert still has to be able to take back off.
+  printf '%s\n' "nvidia-detect $pkgs" | tr ' ' '\n' | sed '/^$/d' | sort -u > "$STATE_DIR/packages"
+  # shellcheck disable=SC2086
+  apt_install $pkgs
+
+  # ---- verify the module actually built --------------------------------------
+  #
+  # This is the check that separates "installed" from "will boot". DKMS failing
+  # is silent from apt's point of view when it is a trigger, and the first
+  # symptom is otherwise a black screen after a reboot.
+
+  log_step "Verifying the kernel module"
+  params=$(nvidia_drm_params)
+  if ! modinfo_bin >/dev/null; then
+    log_warn "modinfo is not available, so whether the DKMS build succeeded cannot"
+    log_warn "be checked here. Before rebooting, run:  sudo dkms status"
+    params=""
+  elif [[ -z ${params// /} ]]; then
+    log_warn "no built nvidia DRM module found. The DKMS build probably failed."
+    log_warn "Check:  sudo dkms status ; sudo dmesg | grep -i nvidia"
+    log_warn "        cat /var/lib/dkms/nvidia*/*/build/make.log"
+    if [[ -n $blacklist ]]; then
+      log_warn "nouveau is blacklisted, so rebooting now is likely to give you a"
+      log_warn "black screen. Run 'omakeb-hw-nvidia revert' before you reboot."
+    fi
+    log_warn "Skipping early KMS: there is no module to load early."
+    opt_early_kms=
+  else
+    log_ok "nvidia_drm built, declares: $params"
+    case " $params " in
+      *" modeset "*) ;;
+      *) log_warn "the built module does not declare 'modeset'; writing it anyway would" \
+                  "prevent it loading, so modesetting cannot be enabled here"
+         refuse "nvidia_drm has no 'modeset' parameter — this driver is not usable for Wayland." \
+                "To undo: omakeb-hw-nvidia revert" ;;
+    esac
+    case " $params " in
+      *" fbdev "*) log_ok "fbdev parameter present; it will be set" ;;
+      *) log_warn "the built module does not declare 'fbdev'; leaving it out" ;;
+    esac
+  fi
+
+  # ---- files -----------------------------------------------------------------
+
+  log_step "Kernel module options"
+  modprobe_body "$params" | write_file_sudo "$MODPROBE_FILE" 0644
+
+  if [[ -n $opt_early_kms ]]; then
+    log_step "Early KMS"
+    initramfs_block_body | block_set "$INITRAMFS_MODULES" sudo
+    : > "$STATE_DIR/early-kms"
+  else
+    log_step "Early KMS (skipped)"
+    log_skip "$INITRAMFS_MODULES not touched"
+  fi
+
+  log_step "Rebuilding the initramfs"
+  if sudo update-initramfs -u; then
+    log_ok "initramfs rebuilt"
+  else
+    log_warn "update-initramfs failed. Do NOT reboot until you know why."
+    log_warn "Undo with: omakeb-hw-nvidia revert"
+  fi
+
+  log_step "Hyprland environment"
+  hypr_env_body | write_file "$HYPR_ENV_FILE" 0644
+  hypr_source_block_body | block_set "$USER_HYPR_CONF" user
+
+  # ---- done ------------------------------------------------------------------
+
+  gl_mode_cache_clear
+  print_recovery
+  notify-send -a omakeb -i video-display \
+    "NVIDIA setup finished" "Reboot to load the driver. Undo with omakeb-hw-nvidia revert." 2>/dev/null || true
+}
+
+print_recovery() {
+  log_step "Reboot required"
+  log_info "The driver is installed but nothing is using it yet. Reboot now."
+  log_info ""
+  log_info "RECOVERY — worth reading before you do:"
+  log_info ""
+  log_info "  Black screen, Ctrl+Alt+F2 still gives a text console:"
+  log_info "      log in there and run"
+  log_info "          omakeb-hw-nvidia revert --yes && sudo reboot"
+  log_info ""
+  log_info "  Black screen and no console either:"
+  log_info "      reboot, and at the GRUB menu press 'e', add 'nomodeset' to the"
+  log_info "      line beginning 'linux', boot with Ctrl+X, then run the revert."
+  log_info ""
+  log_info "  If omakeb-hw-nvidia itself will not run, by hand:"
+  log_info "      sudo rm -f $MODPROBE_FILE"
+  log_info "      sudo nano $INITRAMFS_MODULES     (delete the omakeb block)"
+  log_info "      sudo update-initramfs -u"
+  log_info "      rm -f $HYPR_ENV_FILE"
+  log_info "      sudo apt purge nvidia-driver"
+  log_info ""
+  log_info "This feature has not been tested on real NVIDIA hardware. If it goes"
+  log_info "wrong, the revert above is the supported way back."
+}
+
+# --- revert -------------------------------------------------------------------
+
+cmd_revert() {
+  local pkgs=
+
+  [[ -f $STATE_DIR/packages ]] && pkgs=$(tr '\n' ' ' < "$STATE_DIR/packages")
+
+  log_step "What revert will undo"
+  log_info "  remove  $MODPROBE_FILE"
+  log_info "  remove  the omakeb block from $INITRAMFS_MODULES"
+  log_info "  remove  $HYPR_ENV_FILE"
+  log_info "  remove  the omakeb block from $USER_HYPR_CONF"
+  log_info "  run     sudo update-initramfs -u"
+  if [[ -n $opt_keep_packages ]]; then
+    log_info "  keep    the installed packages (--keep-packages)"
+  elif [[ -n ${pkgs// /} ]]; then
+    log_info "  purge   $pkgs"
+  else
+    log_info "  purge   nothing: no record of packages installed by this command"
+  fi
+  log_info ""
+  local components_added=
+  [[ -f $STATE_DIR/components-added ]] && components_added=$(cat "$STATE_DIR/components-added")
+  if [[ -n ${components_added// /} ]]; then
+    log_info "NOT undone: the apt components enable added ($components_added) stay on."
+  else
+    log_info "NOT undone: the contrib and non-free apt components stay enabled."
+  fi
+  log_info "Other software may have been installed from them since (Steam is"
+  log_info "contrib), and taking them away would strand it without security"
+  log_info "updates. Edit $OMAKEB_COMPONENTS_SOURCE by hand if you want them gone."
+
+  confirm "Proceed?" || { log_info "Nothing was changed."; exit 0; }
+
+  sudo_keepalive_start
+
+  log_step "Hyprland environment"
+  block_clear "$USER_HYPR_CONF" user
+  if [[ -f $HYPR_ENV_FILE ]]; then
+    rm -f "$HYPR_ENV_FILE"
+    log_ok "removed $HYPR_ENV_FILE"
+  else
+    log_skip "not present: $HYPR_ENV_FILE"
+  fi
+
+  log_step "Kernel module options"
+  if sudo test -f "$MODPROBE_FILE"; then
+    sudo rm -f "$MODPROBE_FILE"
+    log_ok "removed $MODPROBE_FILE"
+  else
+    log_skip "not present: $MODPROBE_FILE"
+  fi
+
+  log_step "Early KMS"
+  block_clear "$INITRAMFS_MODULES" sudo
+
+  if [[ -z $opt_keep_packages && -n ${pkgs// /} ]]; then
+    log_step "Packages"
+    # shellcheck disable=SC2086
+    apt_purge $pkgs
+
+    # nvidia-driver is a metapackage. Purging it alone leaves the DKMS package
+    # behind, still rebuilding a module on every kernel upgrade, which is not a
+    # revert. Only auto-installed ones, so nothing the user chose is touched.
+    local leftovers
+    leftovers=$(nvidia_leftovers | tr '\n' ' ')
+    if [[ -n ${leftovers// /} ]]; then
+      log_info "also purging what apt pulled in automatically: $leftovers"
+      # shellcheck disable=SC2086
+      apt_purge $leftovers
+    fi
+
+    leftovers=$(dpkg-query -W -f='${db:Status-Status}\t${binary:Package}\n' 'nvidia*' 2>/dev/null \
+                | awk -F'\t' '$1 == "installed" { print $2 }' | tr '\n' ' ') || true
+    if [[ -n ${leftovers// /} ]]; then
+      log_warn "still installed, because you installed them yourself: $leftovers"
+      log_info "Remove them by hand if you want a completely clean machine."
+    fi
+  fi
+
+  log_step "Rebuilding the initramfs"
+  if sudo update-initramfs -u; then
+    log_ok "initramfs rebuilt"
+  else
+    log_warn "update-initramfs failed; run it by hand before rebooting"
+  fi
+
+  rm -rf "$STATE_DIR"
+  gl_mode_cache_clear
+
+  log_done "Reverted. Reboot to go back to the previous driver."
+  notify-send -a omakeb -i video-display \
+    "NVIDIA setup reverted" "Reboot to return to the previous driver." 2>/dev/null || true
+}
+
+# --- confirmation -------------------------------------------------------------
+
+confirm() {
+  local prompt=$1 reply
+  if [[ -n $opt_yes ]]; then
+    log_info "--yes given; proceeding."
+    return 0
+  fi
+  if [[ ! -t 0 ]]; then
+    log_error "no terminal to ask on, and --yes was not given."
+    log_info "Run this from a terminal, or pass --yes if you have read the plan above."
+    exit 1
+  fi
+  printf '\n%s [y/N] ' "$prompt"
+  read -r reply
+  case "$reply" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# --- usage --------------------------------------------------------------------
+
+usage() {
+  cat <<'USAGE'
+omakeb-hw-nvidia — NVIDIA proprietary driver support for the Hyprland session.
+
+  omakeb-hw-nvidia detect
+      Report the graphics hardware, Secure Boot state and current setup.
+      Changes nothing.
+
+  omakeb-hw-nvidia show
+      Print the exact files enable would write. Changes nothing.
+
+  omakeb-hw-nvidia enable [--yes] [--no-early-kms] [--accept-unknown-secure-boot]
+      Enable contrib and non-free, install the driver nvidia-detect recommends
+      plus kernel headers, turn DRM modesetting on, and set the two Hyprland
+      environment variables. Summarises everything first and asks.
+
+      --yes                          skip the confirmation (non-interactive use)
+      --no-early-kms                 do not add the modules to the initramfs.
+                                     Early KMS removes boot flicker but can break
+                                     resume from hibernation on some machines.
+      --accept-unknown-secure-boot   proceed when the Secure Boot state cannot be
+                                     read. Prefer installing mokutil instead.
+
+  omakeb-hw-nvidia revert [--yes] [--keep-packages]
+      Undo everything enable did.
+
+It refuses, without changing anything, when there is no NVIDIA card, when
+Secure Boot is on, when the machine is a laptop with hybrid graphics, or when
+nothing is plugged into the NVIDIA card. A desktop that merely has integrated
+graphics enabled alongside it is fine.
+
+NOT TESTED ON REAL NVIDIA HARDWARE. See the recovery notes at the top of the
+script, or run `omakeb-hw-nvidia show`.
+USAGE
+}
+
+# --- entry point --------------------------------------------------------------
+#
+# Wrapped in main() and guarded, so test/lint-nvidia.sh can source this file and
+# exercise the block editors directly. The block editors are the part that
+# rewrites the user's own Hyprland config, and a bug there breaks config parsing
+# for the whole session — which is the same black screen this command exists to
+# avoid. It is the one piece we can genuinely test without an NVIDIA card, so it
+# is made testable on purpose.
+
+main() {
+  local cmd
+  cmd=${1:-detect}
+  [[ $# -gt 0 ]] && shift
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes|-y)                     opt_yes=1 ;;
+      --no-early-kms)               opt_early_kms= ;;
+      --keep-packages)              opt_keep_packages=1 ;;
+      --accept-unknown-secure-boot) opt_accept_unknown_sb=1 ;;
+      *) die "unknown option: $1  (try: omakeb-hw-nvidia help)" ;;
+    esac
+    shift
+  done
+
+  case "$cmd" in
+    detect)         cmd_detect ;;
+    show)           cmd_show ;;
+    enable)         cmd_enable ;;
+    revert)         cmd_revert ;;
+    help|-h|--help) usage ;;
+    *)              usage; exit 1 ;;
+  esac
+}
+
+[[ -n ${OMAKEB_HW_NVIDIA_LIB:-} ]] || main "$@"

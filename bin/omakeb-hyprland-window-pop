@@ -1,0 +1,60 @@
+#!/bin/bash
+
+# omakeb:summary=Pop the active window out: float it, pin it and centre it.
+
+# SUPER+O. "Pop out" is one gesture, not three: a tiled window becomes a
+# floating, pinned, centred one that stays visible while you switch workspaces
+# — for a video, a chat window or a reference page. Pressing it again hands the
+# window back to the tiling layout, which is why this reads the current state
+# rather than dispatching blindly.
+#
+# `pin` only applies to floating windows in Hyprland, so the order matters:
+# float first, then pin, then centre. Dispatchers take `active` explicitly
+# rather than relying on the empty-argument default.
+
+set -euo pipefail
+
+notify() {
+  command -v notify-send >/dev/null &&
+    notify-send -a omakeb \
+      -h string:x-canonical-private-synchronous:omakeb-window "$@" || true
+}
+
+if ! command -v hyprctl >/dev/null; then
+  notify "omakeb" "hyprctl not found; is Hyprland running?"
+  exit 1
+fi
+
+floating=""
+pinned=""
+
+# jq is optional: without it the current state is unreadable, so the key
+# degrades to the one-way "pop out" instead of doing nothing.
+if command -v jq >/dev/null; then
+  # `|| true` throughout: hyprctl exits non-zero with no compositor to talk to,
+  # and jq exits non-zero if it is handed hyprctl's non-JSON error text.
+  active=$(hyprctl activewindow -j 2>/dev/null || true)
+  address=$(printf '%s' "$active" | jq -r '.address // empty' 2>/dev/null || true)
+
+  # Empty address means nothing is focused (an empty workspace reports `{}`).
+  [[ -n $address ]] || exit 0
+
+  floating=$(printf '%s' "$active" | jq -r '.floating // false' 2>/dev/null || true)
+  pinned=$(printf '%s' "$active" | jq -r '.pinned // false' 2>/dev/null || true)
+fi
+
+# One hyprctl call per dispatch rather than a single --batch string: hyprctl
+# joins its argv, so the dispatcher sees exactly "setfloating active" with no
+# stray whitespace to defeat Hyprland's `args == "active"` comparison.
+dispatch() { hyprctl dispatch "$@" >/dev/null 2>&1 || true; }
+
+if [[ $floating == true && $pinned == true ]]; then
+  # Already popped out: unpin first, because a pinned window cannot be tiled.
+  dispatch pin active
+  dispatch togglefloating active
+  exit 0
+fi
+
+dispatch setfloating active
+[[ $pinned == true ]] || dispatch pin active
+dispatch centerwindow

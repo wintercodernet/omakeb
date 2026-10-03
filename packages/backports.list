@@ -1,0 +1,20 @@
+# Tier 1, trixie-backports. Not available in trixie main at all.
+# Pinned to priority 500 by install/10-sources.sh.
+hyprland
+hyprlock
+hypridle
+hyprpaper
+hyprpicker
+hyprsunset
+# Provides hyprland-dialog. Without it Hyprland shows "Your system does not have
+# hyprland-guiutils installed" on every login, and — less visibly — logs
+# "hyprland-dialog missing from PATH, cannot start ANRManager", so there is no
+# dialog offering to kill an application that has stopped responding.
+#
+# The Debian package to ask for is hyprland-guiutils. hyprland-qtutils is a
+# transitional dummy that only depends on it, and the name is now misleading:
+# guiutils is built on hyprtoolkit and pulls no Qt at all — 688 kB plus
+# libhyprtoolkit5.
+hyprland-guiutils
+xdg-desktop-portal-hyprland
+uwsm

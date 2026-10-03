@@ -1,0 +1,70 @@
+#!/bin/bash
+
+# omakeb:summary=Copy, paste or cut in the focused window, terminals included.
+# omakeb:args=<copy|paste|cut>
+
+# SUPER+C/V/X is one muscle memory for the whole desktop (clipboard.conf). The
+# work is deciding which real chord the focused window wants: terminals hand
+# CTRL+C to the foreground process, so they use CTRL+SHIFT+C and SHIFT+Insert
+# instead. We look at the window class and forward the right chord with
+# Hyprland's sendshortcut dispatcher.
+#
+# The chord is aimed at the window's address rather than `activewindow`, because
+# the dispatch is asynchronous: if focus moves in between, the keystroke should
+# still land where the user was looking.
+#
+# Upstream Omarchy splits the synthetic keystroke into down/up to work around
+# hyprwm/Hyprland#14099, where the modifier state of a shortcut sent while a
+# real modifier (here SUPER) is still held can stick. sendshortcut does not
+# appear to have that problem on 0.55, so the default path is a single
+# dispatch. If it turns out to bite, set OMAKEB_CLIPBOARD_KEYSTATE=1 to get the
+# explicit down/up form instead — the escape hatch lives here, not in the
+# bindings file.
+
+set -euo pipefail
+
+action=${1:-}
+
+# Window classes that need the terminal chords. Matched case-insensitively
+# against the whole class, so "Alacritty" and "alacritty" both hit.
+terminal_classes='^(kitty|foot|footclient|alacritty|wezterm|org\.wezfurlong\.wezterm|com\.mitchellh\.ghostty|ghostty|st|xterm|urxvt|rxvt-unicode|terminator|tilix|rio|contour|konsole|org\.kde\.konsole|xfce4-terminal|gnome-terminal|org\.gnome\.terminal|io\.elementary\.terminal|dev\.warp\.warp)$'
+
+window=$(hyprctl activewindow -j 2>/dev/null || true)
+class=$(jq -r '.class // ""' <<<"$window" 2>/dev/null || true)
+address=$(jq -r '.address // ""' <<<"$window" 2>/dev/null || true)
+
+# With nothing focused there is no sensible target; a keystroke sent into the
+# void would only confuse.
+[[ -n $address ]] || exit 0
+target="address:$address"
+
+if [[ ${class,,} =~ $terminal_classes ]]; then
+  case $action in
+    # Nothing in a terminal has a cut, so cut degrades to copy rather than
+    # sending a chord the application will read as something else.
+    copy|cut) modifiers="CTRL SHIFT"; key=C ;;
+    paste)    modifiers="SHIFT";      key=Insert ;;
+    *)        modifiers=;             key= ;;
+  esac
+else
+  case $action in
+    copy)  modifiers="CTRL"; key=C ;;
+    paste) modifiers="CTRL"; key=V ;;
+    cut)   modifiers="CTRL"; key=X ;;
+    *)     modifiers=;       key= ;;
+  esac
+fi
+
+if [[ -z $key ]]; then
+  notify-send -a omakeb -u critical "omakeb-clipboard" \
+    "Usage: omakeb-clipboard copy|paste|cut"
+  exit 2
+fi
+
+if [[ ${OMAKEB_CLIPBOARD_KEYSTATE:-0} == 1 ]]; then
+  hyprctl --batch \
+    "dispatch sendkeystate $modifiers, $key, down, $target ; dispatch sendkeystate $modifiers, $key, up, $target" \
+    >/dev/null
+else
+  hyprctl dispatch sendshortcut "$modifiers, $key, $target" >/dev/null
+fi

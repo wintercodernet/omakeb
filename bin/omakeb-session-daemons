@@ -1,0 +1,159 @@
+#!/bin/bash
+
+# omakeb:summary=Start the session daemons that systemd did not start.
+
+# Reads default/session-daemons.tsv and makes the session match it, whichever
+# way the session was launched. The list's header explains why the five daemons
+# in it need this and the ones in autostart.conf do not; the short version:
+#
+#   * launched through uwsm — graphical-session.target is reached and systemd
+#     starts all five. We must start nothing, or there are two of each.
+#   * launched bare (install/80-services.sh's no-uwsm fallback, or Hyprland from
+#     a TTY) — the target is never reached, systemd starts none of them, and
+#     until this script existed neither did anything else.
+#
+# WHY THIS ASKS INSTEAD OF DECIDING AT INSTALL TIME
+#
+# The obvious alternative is to render autostart.conf at install time with the
+# exec-once lines the machine turns out to need. It cannot be right: the same
+# machine boots both ways. greetd starts the uwsm session, and the person
+# debugging a black screen logs into a TTY and runs Hyprland by hand — which is
+# exactly when they need a bar and a lock most, and exactly what an install-time
+# decision would have got wrong.
+#
+# So: converge, do not predict. Give any unit that is loaded a few seconds to
+# come up on its own, then start whatever is still not running. We never need to
+# work out WHY it did not start.
+#
+# WHY omakeb-daemon RATHER THAN `systemctl --user start`
+#
+# On the bare path the units are loaded (dpkg enabled them) but the session is
+# not systemd-managed, so the user manager may never have been told the
+# session's WAYLAND_DISPLAY. A unit started into that environment cannot reach
+# the compositor. omakeb-daemon inherits our environment, which is the
+# compositor's own, so it always can. The cost is that those daemons run
+# unsupervised on the fallback path — which is what "not a systemd user session"
+# already means, and 80-services.sh warns about it at install time.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+# Both overridable so the tests can drive this without a compositor; nothing but
+# the tests ever sets them.
+list=${OMAKEB_SESSION_DAEMONS:-$OMAKEB_PATH/default/session-daemons.tsv}
+# Seconds to let systemd bring a loaded unit up before concluding it is not
+# going to. Paid once, concurrently for all five, and only on a session where
+# something is actually missing.
+wait_secs=${OMAKEB_SESSION_DAEMON_WAIT:-4}
+
+# Called by path, not by name. This is the one script that runs before anything
+# has confirmed the session's PATH contains our bin/ — that failure mode has
+# already cost us once, with omakeb-gl-fallback (see install/60-config.sh).
+# Overridable so test/lint-session-daemons.sh can watch what would be started;
+# nothing but the tests ever sets it.
+daemon=${OMAKEB_DAEMON:-$OMAKEB_PATH/bin/omakeb-daemon}
+
+[[ -r $list ]] || { echo "omakeb-session-daemons: cannot read $list" >&2; exit 1; }
+
+names=() units=() bins=() offs=()
+while read -r name unit bin off _rest; do
+  [[ -z ${name:-} || ${name:0:1} == "#" ]] && continue
+  # A row missing its off-toggle column means "no toggle", not an unset variable
+  # that dies under `set -u`. test/lint-autostart.py requires all four, so this
+  # only ever catches a hand-edited file.
+  names+=("$name"); units+=("${unit:-}"); bins+=("${bin:-}"); offs+=("${off:--}")
+done < "$list"
+
+# C3: a toggle is on when $OMAKEB_STATE/toggles/<name> exists. Tested directly
+# rather than through omakeb-toggle-enabled for the PATH reason above.
+wanted() {
+  [[ $1 == "-" ]] && return 0
+  [[ ! -e "$OMAKEB_STATE/toggles/$1" ]]
+}
+
+# "active" is the only state that means the daemon is up. "activating" is
+# systemd having started the job, which is a promise and good enough to leave
+# alone; anything else — inactive, failed, or no user manager at all — is ours
+# to deal with.
+unit_state() {
+  systemctl --user is-active "$1" 2>/dev/null || true
+}
+
+# Wait for the units systemd is expected to bring up. One shared deadline, so
+# five daemons cost one wait rather than five.
+settle() {
+  local -a pending=("$@")
+  local deadline=$((SECONDS + wait_secs)) unit state
+  local -a still
+  while ((SECONDS < deadline)); do
+    still=()
+    for unit in "${pending[@]}"; do
+      state=$(unit_state "$unit")
+      [[ $state == active || $state == activating ]] && continue
+      still+=("$unit")
+    done
+    ((${#still[@]} == 0)) && return 0
+    pending=("${still[@]}")
+    sleep 0.2
+  done
+  return 0
+}
+
+# --- decide, wait, act --------------------------------------------------------
+
+# Only a loaded unit can be started by systemd, so only a loaded unit is worth
+# waiting for. On a machine with no user manager at all, unit_managed is false
+# for every row and the wait is skipped entirely.
+expected=()
+for i in "${!names[@]}"; do
+  wanted "${offs[i]}" || continue
+  unit_managed "${units[i]}" && expected+=("${units[i]}")
+done
+((${#expected[@]})) && settle "${expected[@]}"
+
+for i in "${!names[@]}"; do
+  unit=${units[i]} bin=${bins[i]}
+  state=$(unit_state "$unit")
+
+  if wanted "${offs[i]}"; then
+    # Up already, or on its way: leave it alone. This is the uwsm path, and it
+    # is the whole reason these five are not plain exec-once lines.
+    [[ $state == active || $state == activating ]] && continue
+    # Not coming. omakeb-daemon is a no-op if it is somehow running anyway, so
+    # losing a race here costs nothing.
+    "$daemon" "$bin"
+  else
+    # The toggle says off. If systemd started it, stop it — explicitly, so
+    # Restart=on-failure does not fire (lib/units.sh says why). If systemd did
+    # not, we simply never started it and there is nothing to do.
+    [[ $state == active || $state == activating ]] &&
+      systemctl --user stop "$unit" >/dev/null 2>&1 || true
+  fi
+done
+
+# --- state that can only be applied once its daemon is up ---------------------
+#
+# Both of these used to be exec-once lines racing the daemon they talk to. On
+# the uwsm path they usually won, because systemd had started it before Hyprland
+# got here; on the fallback path the daemon did not exist at all. Here they run
+# after the loop above, which is the first moment either is guaranteed to be
+# addressable.
+
+# hyprsunset defaults to 6000K — a warm tint nobody asked for — so this runs
+# unconditionally, not only when the toggle is on. See omakeb-nightlight-apply.
+nightlight=${OMAKEB_NIGHTLIGHT_APPLY:-$OMAKEB_PATH/bin/omakeb-nightlight-apply}
+if [[ -x $nightlight ]]; then
+  "$nightlight" || true
+fi
+
+# Do-not-disturb is a mako MODE, so it can only be set once mako owns the bus
+# name. Being started is not the same as having claimed it, and there is no
+# readiness signal to wait on — so retry briefly rather than sleep and hope,
+# which is what the old `sleep 2 && makoctl` line did.
+if [[ -e "$OMAKEB_STATE/toggles/dnd" ]] && command -v makoctl >/dev/null 2>&1; then
+  for _ in $(seq 1 20); do
+    makoctl mode -s do-not-disturb >/dev/null 2>&1 && break
+    sleep 0.25
+  done
+fi

@@ -1,0 +1,69 @@
+#!/bin/bash
+
+# omakeb:summary=React to the laptop lid opening or closing.
+# omakeb:args=close|open
+
+# Bound from default/hypr/bindings/utilities.conf with the `l` (locked) flag, so
+# this fires even when the session is already locked.
+#
+# The rule we implement: closing the lid on a laptop with an external display
+# attached is "clamshell mode" — turn off the internal panel and keep working.
+# With no external display it means "I am leaving" — lock, then let logind
+# handle suspend. We deliberately do NOT call `systemctl suspend` ourselves;
+# logind already has a HandleLidSwitch policy, and racing it produces the classic
+# suspend-resume-suspend loop.
+
+set -euo pipefail
+
+action=${1:-}
+
+notify() {
+  command -v notify-send >/dev/null || return 0
+  notify-send -a omakeb -h string:x-canonical-private-synchronous:omakeb-lid "$@" || true
+}
+
+# The internal panel is eDP-* on essentially all laptops; anything else attached
+# and enabled counts as external.
+internal_monitor() {
+  hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.name | test("^eDP")) | .name' | head -1
+}
+
+external_count() {
+  hyprctl monitors -j 2>/dev/null | jq '[.[] | select(.name | test("^eDP") | not)] | length'
+}
+
+case "$action" in
+  close)
+    internal=$(internal_monitor)
+    externals=$(external_count 2>/dev/null || echo 0)
+
+    if [[ -n $internal && ${externals:-0} -gt 0 ]]; then
+      # Clamshell: remember which panel we disabled so `open` can restore it
+      # without having to guess.
+      printf '%s\n' "$internal" > "${XDG_STATE_HOME:-$HOME/.local/state}/omakeb/lid-disabled-monitor" 2>/dev/null || true
+      hyprctl keyword monitor "$internal,disable" >/dev/null
+      notify "Clamshell mode" "Internal display off, $externals external display(s) active"
+    else
+      # No external display: lock now so the screen is already protected by the
+      # time logind suspends. Suspend itself stays logind's job.
+      omakeb-system-lock &
+    fi
+    ;;
+
+  open)
+    state_file="${XDG_STATE_HOME:-$HOME/.local/state}/omakeb/lid-disabled-monitor"
+    if [[ -f $state_file ]]; then
+      monitor=$(cat "$state_file")
+      # Re-enable with preferred mode, auto position, scale 1 — Hyprland's own
+      # monitor rules in default/hypr/monitors take over from there.
+      hyprctl keyword monitor "$monitor,preferred,auto,1" >/dev/null
+      rm -f "$state_file"
+      notify "Display restored" "$monitor re-enabled"
+    fi
+    ;;
+
+  *)
+    echo "usage: omakeb-system-lid close|open" >&2
+    exit 2
+    ;;
+esac

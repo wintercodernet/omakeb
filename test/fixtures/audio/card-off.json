@@ -1,0 +1,130 @@
+[
+  {
+    "id": 43,
+    "type": "PipeWire:Interface:Device",
+    "info": {
+      "props": {
+        "device.api": "alsa",
+        "device.nick": "HDA Intel PCH",
+        "device.name": "alsa_card.pci-0000_80_1f.3"
+      },
+      "params": {
+        "Profile": [
+          {
+            "index": 0,
+            "description": "Off"
+          }
+        ],
+        "Route": [],
+        "EnumRoute": [
+          {
+            "direction": "Output",
+            "name": "analog-output-headphones",
+            "description": "Headphones",
+            "available": "yes"
+          },
+          {
+            "direction": "Output",
+            "name": "analog-output-lineout",
+            "description": "Line Out",
+            "available": "no"
+          }
+        ],
+        "EnumProfile": [
+          {
+            "index": 0,
+            "description": "Off"
+          },
+          {
+            "index": 2,
+            "description": "Analog Stereo Output"
+          },
+          {
+            "index": 1,
+            "description": "Analog Stereo Duplex"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "id": 45,
+    "type": "PipeWire:Interface:Device",
+    "info": {
+      "props": {
+        "device.api": "alsa",
+        "device.nick": "HDA NVidia",
+        "device.name": "alsa_card.pci-0000_02_00.1"
+      },
+      "params": {
+        "Profile": [
+          {
+            "index": 1,
+            "description": "Digital Stereo (HDMI) Output"
+          }
+        ],
+        "Route": [
+          {
+            "direction": "Output",
+            "name": "hdmi-output-0",
+            "description": "HDMI / DisplayPort",
+            "available": "yes"
+          }
+        ],
+        "EnumRoute": [
+          {
+            "direction": "Output",
+            "name": "hdmi-output-0",
+            "description": "HDMI / DisplayPort",
+            "available": "yes"
+          }
+        ],
+        "EnumProfile": [
+          {
+            "index": 0,
+            "description": "Off"
+          },
+          {
+            "index": 1,
+            "description": "Digital Stereo (HDMI) Output"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "id": 73,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "media.class": "Audio/Sink",
+        "node.name": "alsa_output.pci-0000_02_00.1.hdmi-stereo",
+        "alsa.card": 0,
+        "device.id": 45
+      },
+      "params": {
+        "Props": [
+          {
+            "mute": false,
+            "volume": 0.56
+          }
+        ]
+      }
+    }
+  },
+  {
+    "id": 30,
+    "type": "PipeWire:Interface:Metadata",
+    "props": {
+      "metadata.name": "default"
+    },
+    "metadata": [
+      {
+        "key": "default.audio.sink",
+        "value": {
+          "name": "alsa_output.pci-0000_02_00.1.hdmi-stereo"
+        }
+      }
+    ]
+  }
+]

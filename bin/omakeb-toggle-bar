@@ -1,0 +1,39 @@
+#!/bin/bash
+
+# omakeb:summary=Show or hide the top bar.
+
+# The toggle name is the non-default condition ("bar-hidden"), so a fresh
+# install needs no seeding: no file means the bar is up.
+#
+# Debian enables waybar.service as a user unit, and on a uwsm session systemd
+# owns waybar — see lib/units.sh. pkill would look like a failure to systemd
+# (Restart=on-failure) and the bar would come straight back. On a session that
+# never reached graphical-session.target the same helpers fall back to the
+# process, which is what omakeb-session-daemons started.
+#
+# The unit/binary pair below must match default/session-daemons.tsv, so that
+# session start and this toggle cannot disagree about what waybar is;
+# test/lint-autostart.py checks that.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+state=$OMAKEB_STATE/toggles/bar-hidden
+
+notify() {
+  notify-send -a omakeb -i "$2" \
+    -h string:x-canonical-private-synchronous:omakeb-toggle-bar \
+    "Top bar" "$1"
+}
+
+if [[ -e $state ]]; then
+  service_up waybar.service waybar
+  rm -f "$state"
+  notify "Shown" view-reveal
+else
+  service_down waybar.service waybar
+  mkdir -p "${state%/*}"
+  : > "$state"
+  notify "Hidden" view-conceal
+fi

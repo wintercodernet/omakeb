@@ -1,0 +1,32 @@
+#!/bin/bash
+
+# omakeb:summary=Toggle the warm night light filter.
+
+# hyprsunset runs continuously as a Debian-enabled systemd user unit, so the
+# toggle changes its temperature over IPC rather than starting or stopping it.
+# See bin/omakeb-nightlight-apply for why. Set OMAKEB_NIGHTLIGHT_TEMP to change
+# the warmth rather than editing this.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+state=$OMAKEB_STATE/toggles/nightlight
+temperature=${OMAKEB_NIGHTLIGHT_TEMP:-4000}
+
+notify() {
+  notify-send -a omakeb -i "$2" \
+    -h string:x-canonical-private-synchronous:omakeb-toggle-nightlight \
+    "Night light" "$1"
+}
+
+if [[ -e $state ]]; then
+  rm -f "$state"
+  omakeb-nightlight-apply
+  notify "Off" weather-clear
+else
+  mkdir -p "${state%/*}"
+  : > "$state"
+  omakeb-nightlight-apply
+  notify "On — ${temperature}K" weather-clear-night
+fi

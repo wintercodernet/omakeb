@@ -1,0 +1,40 @@
+#!/bin/bash
+
+# omakeb:summary=List the installed themes.
+# omakeb:args=[--long]
+
+# Plain names on stdout, one per line, so the menu can pipe this straight into
+# fuzzel. `--long` adds where each theme came from, which is the question that
+# actually gets asked about an imported one.
+#
+# The user's themes shadow ours: $OMAKEB_CONFIG/themes/<name> wins over
+# $OMAKEB_PATH/themes/<name>, so importing a theme that shares a name with a
+# shipped one replaces it rather than colliding with it.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+long=
+[[ ${1:-} == --long ]] && long=1
+
+current=$(theme_current)
+
+if [[ -z $long ]]; then
+  theme_names
+  exit 0
+fi
+
+# The active marker is its own leading column rather than a padded field:
+# printf pads by bytes, and a three-byte ✓ in a %-9s field misaligns the row.
+printf '%s %-20s %-8s %s\n' ' ' NAME SOURCE ORIGIN
+while IFS= read -r name; do
+  [[ -n $name ]] || continue
+  dir=$(theme_dir "$name") || continue
+  source_kind=shipped
+  [[ $dir == "$OMAKEB_CONFIG"/* ]] && source_kind=user
+  origin=$(cat "$dir/origin" 2>/dev/null || echo omakeb)
+  active=' '
+  [[ $name == "$current" ]] && active='✓'
+  printf '%s %-20s %-8s %s\n' "$active" "$name" "$source_kind" "$origin"
+done < <(theme_names)

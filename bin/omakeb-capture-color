@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# omakeb:summary=Pick a colour from the screen and copy it to the clipboard.
+
+# hyprpicker has its own --autocopy, but we copy with wl-copy so the value also
+# lands in cliphist history like every other copy on the system.
+
+set -euo pipefail
+
+notify() { # <summary> <body>
+  notify-send -a omakeb -i color-select \
+    -h string:x-canonical-private-synchronous:omakeb-color \
+    "$1" "$2"
+}
+
+# Escape cancels the picker, which exits non-zero with no output.
+colour=$(hyprpicker --format=hex 2>/dev/null || true)
+[[ -n $colour ]] || exit 0
+
+printf '%s' "$colour" | wl-copy
+notify "Colour picked" "$colour — copied"

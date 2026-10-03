@@ -1,0 +1,30 @@
+#!/bin/bash
+
+# omakeb:summary=Toggle do not disturb.
+
+# mako owns the real state here: `makoctl mode -t` flips it and prints the
+# resulting mode list, so we read our state file back off that rather than
+# assuming the two agree. Notifications raised while do-not-disturb is on are
+# held in mako's history by design, so the "On" message may only be visible
+# later via `makoctl restore` — that is the feature working, not a bug.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+state=$OMAKEB_STATE/toggles/dnd
+
+modes=$(makoctl mode -t do-not-disturb)
+
+if grep -qx 'do-not-disturb' <<<"$modes"; then
+  mkdir -p "${state%/*}"
+  : > "$state"
+  body="On"; icon=notification-disabled
+else
+  rm -f "$state"
+  body="Off"; icon=notification
+fi
+
+notify-send -a omakeb -i "$icon" \
+  -h string:x-canonical-private-synchronous:omakeb-toggle-dnd \
+  "Do not disturb" "$body"

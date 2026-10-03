@@ -1,0 +1,65 @@
+#!/bin/bash
+
+# omakeb:summary=Raise or lower the screen backlight.
+# omakeb:args=<up|down|max|min> [step]
+
+# Bound with the `l` flag so it works on the lock screen (media.conf).
+#
+# `min` deliberately lands on 1%, not 0%: a zero backlight is indistinguishable
+# from a dead machine and there is no on-screen way back. `down` carries the
+# same floor, clamped here rather than with brightnessctl's `--min-value`,
+# whose short form takes its argument attached and is easy to misparse.
+
+set -euo pipefail
+
+action=${1:-}
+step=${2:-5}
+[[ $step =~ ^[0-9]+$ ]] || step=5
+
+notify() { # <body> <icon> <value>
+  notify-send -a omakeb -u low -t 1500 -i "$2" \
+    -h string:x-canonical-private-synchronous:omakeb-brightness \
+    -h "int:value:$3" \
+    "Brightness" "$1"
+}
+
+if ! brightnessctl -m >/dev/null 2>&1; then
+  notify-send -a omakeb -u critical \
+    -h string:x-canonical-private-synchronous:omakeb-brightness \
+    "Brightness" "No backlight device on this machine"
+  exit 1
+fi
+
+# -m is the machine-readable form: device,class,current,percent%,max
+current=$(brightnessctl -m | cut -d, -f4 | tr -d '%')
+[[ $current =~ ^[0-9]+$ ]] || current=0
+
+case $action in
+  up)
+    brightnessctl -q set "${step}%+"
+    ;;
+  down)
+    if (( current - step < 1 )); then
+      brightnessctl -q set 1%
+    else
+      brightnessctl -q set "${step}%-"
+    fi
+    ;;
+  max)  brightnessctl -q set 100% ;;
+  min)  brightnessctl -q set 1% ;;
+  *)
+    notify-send -a omakeb -u critical "omakeb-brightness" \
+      "Usage: omakeb-brightness up|down|max|min [step]"
+    exit 2
+    ;;
+esac
+
+percent=$(brightnessctl -m | cut -d, -f4 | tr -d '%')
+[[ $percent =~ ^[0-9]+$ ]] || percent=0
+
+if   (( percent >= 66 )); then icon=display-brightness-high
+elif (( percent >= 33 )); then icon=display-brightness-medium
+else                           icon=display-brightness-low
+fi
+
+notify "${percent}%" "$icon" "$percent"

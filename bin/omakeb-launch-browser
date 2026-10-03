@@ -1,0 +1,94 @@
+#!/bin/bash
+
+# omakeb:summary=Open the web browser, optionally in a private window.
+# omakeb:args=[--private] [url...]
+
+# The base installs firefox-esr (D13) — Debian's name for it, not "firefox" —
+# so there is always something to open. It is the fallback, not the preference:
+# the order below still tries chromium first, because Chromium's --app is what
+# omakeb-launch-webapp needs for a real chromeless window. Installing chromium
+# therefore takes over with no configuration.
+#
+# Discovered from what is installed rather than hardcoded, so that stays true
+# whichever browsers the user adds or removes later.
+# ~/.config/omakeb/apps.conf wins when it names a command that exists (C2).
+
+set -euo pipefail
+
+notify() {
+  command -v notify-send >/dev/null &&
+    notify-send -a omakeb \
+      -h string:x-canonical-private-synchronous:omakeb-launch "$@" || true
+}
+
+load_apps_conf() {
+  local conf="${OMAKEB_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/omakeb}/apps.conf"
+  [[ -r $conf ]] || return 0
+  set +e
+  # shellcheck source=/dev/null
+  source "$conf"
+  set -e
+}
+
+# Chromium first (matches upstream's default and supports --app for webapps),
+# then Firefox under both Debian and upstream-repo names, then xdg-open as the
+# "whatever the desktop thinks" backstop.
+detect_browser() {
+  local candidate
+  for candidate in chromium chromium-browser firefox firefox-esr xdg-open; do
+    if command -v "$candidate" >/dev/null; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Private-mode flags are per-engine, so derive from the binary name unless the
+# user pinned BROWSER_PRIVATE_FLAG explicitly. An empty result means "this
+# browser has no private mode we know how to ask for".
+default_private_flag() {
+  case "${1##*/}" in
+    chromium* | chrome* | google-chrome* | brave* | vivaldi* | *edge*) printf -- '--incognito\n' ;;
+    firefox* | librewolf* | zen*) printf -- '--private-window\n' ;;
+    *) printf '\n' ;;
+  esac
+}
+
+load_apps_conf
+
+# BROWSER may carry flags of its own, so treat it as a command line rather than
+# a bare name. It is also a conventional environment variable; honour it, but
+# only when it names something runnable, so a stale export cannot break the key.
+browser_argv=()
+if [[ -n ${BROWSER:-} ]]; then
+  read -r -a browser_argv <<<"$BROWSER"
+fi
+if ((${#browser_argv[@]} == 0)) || ! command -v "${browser_argv[0]}" >/dev/null; then
+  browser=$(detect_browser) || {
+    notify "omakeb" "No browser found. Install chromium or firefox-esr, or set BROWSER in apps.conf."
+    exit 1
+  }
+  browser_argv=("$browser")
+fi
+
+private=0
+if [[ ${1-} == --private ]]; then
+  private=1
+  shift
+fi
+
+# Built as one array rather than expanding a possibly-empty one, which `set -u`
+# rejects on older bash.
+cmd=("${browser_argv[@]}")
+
+if ((private)); then
+  flag=${BROWSER_PRIVATE_FLAG-$(default_private_flag "${browser_argv[0]}")}
+  if [[ -n $flag ]]; then
+    cmd+=("$flag")
+  else
+    notify "omakeb" "'${browser_argv[0]}' has no known private-window flag; opening a normal window."
+  fi
+fi
+
+exec "${cmd[@]}" "$@"

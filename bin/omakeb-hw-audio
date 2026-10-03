@@ -1,0 +1,436 @@
+#!/bin/bash
+
+# omakeb:summary=Find audio that is playing but inaudible, and optionally fix it.
+# omakeb:args=[status|fix [--yes]]
+
+# The fault this exists for, in the order it presents itself:
+#
+#   "The volume meter moves. The right device is selected. There is no sound."
+#
+# Every layer reported success. PipeWire had a stream, the sink existed, its
+# volume was up and it was not muted. The audio was inaudible because the ALSA
+# HARDWARE mixer underneath it had Master and Headphone at 0% and switched off —
+# a layer nothing in the desktop displays and, until now, nothing here installed
+# a tool to read.
+#
+# It came with a second failure that is worse, because it is self-sustaining:
+#
+#   * WirePlumber picks a card at login. On a machine whose only connected
+#     output at that moment is HDMI, it takes the HDMI card and leaves the
+#     onboard analog card's profile at "Off".
+#   * A card with profile Off is UNPOWERED, so its codec reports no jacks.
+#   * WirePlumber only turns a card on when something is plugged into it.
+#
+# So the analog card is off because nothing is plugged in, and nothing appears
+# to be plugged in because the card is off. It never recovers on its own, and
+# every port reads "available: no" with headphones physically in the socket.
+# `fix` breaks the loop by turning the card on; jack detection then works
+# normally, because it was never broken.
+#
+# Diagnostic first, repair second, and the repair only does things a person
+# would do by hand: unmute mixer controls, and stop a card falling back to Off.
+# It changes no volume that is already audible and touches no other card.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+# Overridable so the tests can drive every branch from fixtures rather than
+# from whatever sound card the machine running them happens to have. Reading
+# the host by omission is how test/lint-nvidia.sh came to pass on every machine
+# WITHOUT the hardware it was about and fail on the one with it (fact 35).
+PW_DUMP=${OMAKEB_PW_DUMP:-pw-dump}
+AMIXER=${OMAKEB_AMIXER:-amixer}
+WPCTL=${OMAKEB_WPCTL:-wpctl}
+
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+export XDG_RUNTIME_DIR
+
+findings=0
+finding() { findings=$((findings + 1)); log_warn "$*"; }
+
+# ------------------------------------------------------------------------------
+# Reading the machine
+# ------------------------------------------------------------------------------
+
+dump() { $PW_DUMP 2>/dev/null; }
+
+have_pipewire() { command -v "${PW_DUMP%% *}" >/dev/null 2>&1; }
+have_amixer()   { command -v "${AMIXER%% *}" >/dev/null 2>&1; }
+
+# Every ALSA card PipeWire knows about: id, nick, current profile.
+audio_devices() {
+  dump | jq -r '
+    .[] | select(.type=="PipeWire:Interface:Device")
+        | select(.info.props["device.api"]=="alsa")
+        | [ (.id|tostring),
+            (.info.props["device.nick"] // .info.props["device.name"] // "?"),
+            (.info.params.Profile[0].description // "Off")
+          ] | @tsv'
+}
+
+# Sinks: id, node name, alsa card index, muted, volume.
+audio_sinks() {
+  dump | jq -r '
+    .[] | select(.type=="PipeWire:Interface:Node")
+        | select(.info.props["media.class"]=="Audio/Sink")
+        | [ (.id|tostring),
+            (.info.props["node.name"] // "?"),
+            (.info.props["alsa.card"] // "-"|tostring),
+            ((.info.params.Props[0].mute // false)|tostring),
+            ((.info.params.Props[0].volume // 0)|tostring)
+          ] | @tsv'
+}
+
+default_sink_name() {
+  dump | jq -r '
+    .[] | select(.type=="PipeWire:Interface:Metadata")
+        | select(.props."metadata.name"=="default")
+        | .metadata[]? | select(.key=="default.audio.sink") | .value.name' | head -1
+}
+
+# Output routes on one device: description and availability.
+device_routes() {
+  dump | jq -r --argjson d "$1" '
+    .[] | select(.id==$d) | .info.params.Route[]?
+        | select(.direction=="Output")
+        | [ (.description // .name), ((.available // "unknown")|tostring) ] | @tsv'
+}
+
+device_has_connected_output() {
+  dump | jq -e --argjson d "$1" '
+    [ .[] | select(.id==$d) | .info.params.EnumRoute[]?
+          | select(.direction=="Output") | select(.available=="yes") ] | length > 0' >/dev/null 2>&1
+}
+
+# Which mixer controls actually carry the sound right now.
+#
+# NOT all of them. With headphones plugged in, PipeWire deliberately mutes the
+# line-out path — `Front` and `Speaker` sit at [off] on a perfectly healthy
+# machine. Reporting those as faults would make this check cry wolf every time
+# it ran, and a check that is always red is one people learn to ignore.
+#
+# So: Master, which gates everything and is never legitimately off while audio
+# is meant to be audible; PCM, likewise shared; and the one control belonging to
+# the route that is actually selected. An unrecognised route falls back to
+# Master and PCM alone, because guessing wrongly here costs more than the extra
+# coverage is worth.
+relevant_controls() {
+  local route
+  route=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+  printf 'Master\nPCM\n'
+  case "$route" in
+    *headphone*)          printf 'Headphone\n' ;;
+    *line*out* | *speaker* | *analog*) printf 'Speaker\nFront\n' ;;
+  esac
+}
+
+# State of those controls. `amixer sget` prints one line per channel and a
+# leading empty "Mono:" line for a stereo control, so take the first line that
+# actually carries a level. A control with no mute switch has no [on]/[off] at
+# all; report its level and call the switch "n/a" rather than skipping it, since
+# a shared control at 0% is silence just as surely as a muted one.
+mixer_state() {
+  local card=$1 route=${2:-} ctl
+  while IFS= read -r ctl; do
+    [[ -n $ctl ]] || continue
+    $AMIXER -c "$card" sget "$ctl" 2>/dev/null | awk -v c="$ctl" '
+      /Playback [0-9]+ \[[0-9]+%\]/ {
+        pct = "?"; state = "n/a"
+        if (match($0, /\[[0-9]+%\]/)) pct = substr($0, RSTART+1, RLENGTH-3)
+        if (match($0, /\[o(n|ff)\]/)) state = substr($0, RSTART+1, RLENGTH-2)
+        print c "\t" pct "\t" state
+        exit
+      }'
+  done < <(relevant_controls "$route")
+}
+
+# The output route currently selected on a device, by description.
+active_route() {
+  dump | jq -r --argjson d "$1" '
+    .[] | select(.id==$d) | .info.params.Route[]?
+        | select(.direction=="Output") | .description // .name' | head -1
+}
+
+# The PipeWire device id backing a sink, so its route can be looked up.
+device_of_sink() {
+  dump | jq -r --arg n "$1" '
+    .[] | select(.type=="PipeWire:Interface:Node")
+        | select(.info.props["node.name"]==$n)
+        | .info.props["device.id"]' | head -1
+}
+
+# ------------------------------------------------------------------------------
+# status
+# ------------------------------------------------------------------------------
+
+cmd_status() {
+  if ! have_pipewire; then
+    die "pw-dump not found. Is pipewire installed?"
+  fi
+
+  log_step "audio devices"
+  local id nick profile off_cards=()
+  while IFS=$'\t' read -r id nick profile; do
+    [[ -n $id ]] || continue
+    if [[ $profile == "Off" ]]; then
+      if device_has_connected_output "$id"; then
+        finding "card '$nick' is switched Off but has a connected output"
+        off_cards+=("$id")
+      else
+        # The self-sustaining loop. Report it as such, because "no connected
+        # output" on an Off card is not evidence of anything: an Off card is
+        # unpowered and cannot detect a jack either way.
+        log_info "  $nick — profile Off (no jack detected, but an Off card cannot detect one)"
+        off_cards+=("$id")
+      fi
+    else
+      log_ok "$nick — $profile"
+    fi
+  done < <(audio_devices)
+
+  log_step "outputs"
+  local sinks default_name
+  sinks=$(audio_sinks)
+  default_name=$(default_sink_name)
+  if [[ -z $sinks ]]; then
+    finding "there are no audio outputs at all"
+    if (( ${#off_cards[@]} )); then
+      log_info "  ${#off_cards[@]} card(s) are switched Off; 'omakeb-hw-audio fix' turns them on"
+    fi
+  fi
+
+  local sid sname scard smute svol default_card=
+  while IFS=$'\t' read -r sid sname scard smute svol; do
+    [[ -n $sid ]] || continue
+    local marker="  " ; [[ $sname == "$default_name" ]] && { marker=" *"; default_card=$scard; }
+    printf '  %s %s\n' "$marker" "$sname"
+    [[ $smute == true ]] && finding "output '$sname' is muted in PipeWire"
+    # A default sink at zero is silence that looks like working audio.
+    if [[ $sname == "$default_name" ]] && awk -v v="$svol" 'BEGIN{exit !(v+0 < 0.01)}'; then
+      finding "the default output's volume is zero"
+    fi
+  done <<< "$sinks"
+
+  if [[ -n $default_name ]]; then
+    log_info "  default: $default_name"
+  elif [[ -n $sinks ]]; then
+    finding "no default output is set"
+  fi
+
+  # --- the layer that reports nothing ------------------------------------------
+  log_step "hardware mixer"
+  if ! have_amixer; then
+    log_warn "amixer not found, so the ALSA mixer cannot be checked."
+    log_warn "This is the layer where audio goes silent while everything above it"
+    log_warn "reports success. Install it:  sudo apt install alsa-utils"
+    return 0
+  fi
+  if [[ -z ${default_card:-} || $default_card == "-" ]]; then
+    log_skip "no default output on an ALSA card; nothing to check"
+  else
+    local ctl pct state muted=0 route= devid=
+    devid=$(device_of_sink "$default_name")
+    [[ -n $devid && $devid != null ]] && route=$(active_route "$devid")
+    log_info "  route: ${route:-unknown}"
+    while IFS=$'\t' read -r ctl pct state; do
+      [[ -n $ctl ]] || continue
+      if [[ $state == off ]]; then
+        finding "ALSA '$ctl' on card $default_card is MUTED (at ${pct}%)"
+        muted=1
+      elif [[ $pct == 0 ]]; then
+        finding "ALSA '$ctl' on card $default_card is at 0%"
+        muted=1
+      else
+        log_ok "$ctl ${pct}%, ${state}"
+      fi
+    done < <(mixer_state "$default_card" "$route")
+    (( muted )) && log_info "  This is why audio can play with a moving meter and no sound."
+  fi
+
+  log_step "verdict"
+  if (( findings == 0 )); then
+    log_done "Nothing wrong that this check can see."
+    return 0
+  fi
+  log_warn "$findings problem(s) found."
+  log_info "Repair what is safely repairable with:  omakeb-hw-audio fix"
+  return 1
+}
+
+# ------------------------------------------------------------------------------
+# fix
+# ------------------------------------------------------------------------------
+#
+# Only two repairs, both of which a person would do by hand:
+#   1. unmute ALSA playback controls that are off or at zero
+#   2. turn on a card whose profile is Off, and stop it falling back
+# It never lowers a volume, never touches a card that is already working, and
+# never changes which output is the default — that is the user's choice.
+
+WP_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/wireplumber/wireplumber.conf.d/50-omakeb-keep-cards-on.conf"
+
+cmd_fix() {
+  local assume_yes=${1:-}
+
+  have_pipewire || die "pw-dump not found. Is pipewire installed?"
+  have_amixer   || die "amixer not found. Install it:  sudo apt install alsa-utils"
+
+  # --- 1. cards stuck Off -------------------------------------------------------
+  local id nick profile turned_on=0
+  while IFS=$'\t' read -r id nick profile; do
+    [[ $profile == "Off" ]] || continue
+    # Pick an output profile by NAME, never by index: the numbering differs
+    # between codecs and an index chosen on one machine is meaningless on
+    # another. Prefer plain analog stereo output over duplex or surround.
+    local idx
+    idx=$(dump | jq -r --argjson d "$id" '
+      [ .[] | select(.id==$d) | .info.params.EnumProfile[]?
+            | select(.description|test("Analog Stereo Output|Analog Stereo Duplex")) ]
+      | sort_by(.description|test("Output$")|not) | .[0].index // empty')
+    if [[ -z $idx ]]; then
+      log_skip "$nick is Off and offers no analog output profile; leaving it alone"
+      continue
+    fi
+    if [[ -z $assume_yes ]]; then
+      log_info "would turn on '$nick' (profile $idx)"
+    else
+      $WPCTL set-profile "$id" "$idx" && log_ok "turned on '$nick'" && turned_on=1
+    fi
+  done < <(audio_devices)
+
+  # --- 2. the wireplumber drop-in ----------------------------------------------
+  if (( turned_on )); then
+    if [[ -e $WP_CONF ]]; then
+      log_skip "wireplumber already told to keep cards on"
+    elif [[ -z $assume_yes ]]; then
+      log_info "would write $WP_CONF"
+    else
+      mkdir -p "$(dirname "$WP_CONF")"
+      write_file "$WP_CONF" 0644 <<'CONF'
+# Written by omakeb-hw-audio. Delete this file to undo it.
+#
+# Stops a card falling back to the "Off" profile. A card that is Off is
+# unpowered and reports no jacks, so nothing ever gives WirePlumber a reason to
+# turn it back on — the card is off because nothing is plugged in, and nothing
+# appears plugged in because the card is off. Headphones then sit in a live
+# socket with every port reading "available: no".
+#
+# Port selection is deliberately NOT pinned: with the card powered, jack
+# detection works normally, so plugging into a different socket still switches.
+monitor.alsa.rules = [
+  {
+    matches = [ { device.api = "alsa" } ]
+    actions = {
+      update-props = {
+        api.acp.auto-profile = false
+      }
+    }
+  }
+]
+CONF
+      systemctl --user restart wireplumber 2>/dev/null &&
+        log_ok "restarted wireplumber" ||
+        log_warn "could not restart wireplumber; log out and back in"
+    fi
+  fi
+
+  # Wait for the graph to settle before touching the mixer.
+  #
+  # Turning a card on and restarting wireplumber means the default sink does not
+  # exist for a second or two. Without this wait the mixer step below found no
+  # default output, skipped itself, and reported success — so on the machine
+  # that actually has BOTH faults, which is the fresh-install case this whole
+  # command exists for, one run fixed the card and left the mixer muted. The
+  # user would have had to run it twice to get sound, with nothing saying so.
+  if (( turned_on )) && [[ -n $assume_yes ]]; then
+    local waited=0
+    while (( waited < 15 )); do
+      [[ -n "$(default_sink_name)" ]] && break
+      sleep 1
+      waited=$((waited + 1))
+    done
+    (( waited )) && log_info "  waited ${waited}s for the audio graph to settle"
+  fi
+
+  # --- 3. the hardware mixer ----------------------------------------------------
+  local default_card ctl pct state changed=0
+  default_card=$(audio_sinks | awk -F'\t' -v n="$(default_sink_name)" '$2==n{print $3; exit}')
+  if [[ -z $default_card || $default_card == "-" ]]; then
+    log_skip "no default output on an ALSA card; mixer left alone"
+  else
+    local route= devid=
+    devid=$(device_of_sink "$(default_sink_name)")
+    [[ -n $devid && $devid != null ]] && route=$(active_route "$devid")
+    while IFS=$'\t' read -r ctl pct state; do
+      [[ -n $ctl ]] || continue
+      # Never lower anything. Only raise what is silent.
+      if [[ $state == off || $pct == 0 ]]; then
+        if [[ -z $assume_yes ]]; then
+          log_info "would unmute ALSA '$ctl' on card $default_card (now ${pct}%, $state)"
+        else
+          $AMIXER -c "$default_card" sset "$ctl" 80% unmute >/dev/null 2>&1 &&
+            log_ok "unmuted '$ctl' at 80%" && changed=1
+        fi
+      else
+        log_skip "'$ctl' is already audible (${pct}%, $state)"
+      fi
+    done < <(mixer_state "$default_card" "$route")
+
+    if (( changed )); then
+      # Without this the mixer is back to its muted defaults after a reboot and
+      # the whole diagnosis has to happen again.
+      #
+      # `sudo -n true` and not `sudo -v` to ask whether root is available,
+      # and no prompt at all when there is no terminal to
+      # prompt on — this may well be running over ssh while someone debugs
+      # exactly this problem.
+      if sudo -n true 2>/dev/null || [[ -t 0 ]]; then
+        if sudo alsactl store 2>/dev/null; then
+          log_ok "saved the mixer state so it survives a reboot"
+        else
+          log_warn "could not save the mixer state; it will reset on reboot."
+          log_warn "Run this yourself:  sudo alsactl store"
+        fi
+      else
+        log_warn "no root and no terminal to ask on, so the mixer state is NOT saved."
+        log_warn "It will reset on reboot unless you run:  sudo alsactl store"
+      fi
+    fi
+  fi
+
+  if [[ -z $assume_yes ]]; then
+    log_done "Nothing was changed. Re-run with --yes to apply."
+  else
+    log_done "Done. Check with: omakeb-hw-audio"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+
+case "${1:-status}" in
+  status | "") cmd_status ;;
+  fix)
+    shift
+    case "${1:-}" in
+      --yes | -y) cmd_fix yes ;;
+      "")         cmd_fix ;;
+      *)          die "unknown option: $1" ;;
+    esac
+    ;;
+  -h | --help)
+    cat <<'USAGE'
+usage: omakeb-hw-audio [status|fix [--yes]]
+
+  status   (default) report audio that is playing but inaudible
+  fix      show what would be repaired; --yes to apply it
+
+Finds the faults that every layer above them reports as success: an ALSA
+hardware mixer muted underneath a working PipeWire stream, and a sound card
+stuck in the "Off" profile, which is unpowered and therefore cannot detect the
+jack that would cause anything to turn it on.
+USAGE
+    ;;
+  *) die "unknown command: $1
+Try: omakeb-hw-audio --help" ;;
+esac
