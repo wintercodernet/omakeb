@@ -41,6 +41,7 @@ run "keyboard layout" ./test/lint-keyboard.sh
 run "bashrc line" ./test/lint-shell.sh
 run "monitor policy" ./test/lint-monitor.sh
 run "session services" ./test/lint-services.sh
+run "network handover" ./test/lint-network.sh
 run "optional software" ./test/lint-apps.sh
 run "migrations" ./test/lint-migrations.sh
 run "fonts" python3 test/lint-fonts.py

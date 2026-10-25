@@ -330,7 +330,7 @@ write_file "$config_home/waybar/config.jsonc" 0644 <<'WAYBARCONF'
     "format-linked": "󰈀",
     "format-disconnected": "󰖪",
     "tooltip-format": "{ifname}  {ipaddr}",
-    "on-click": "omakeb-launch-once nm-connection-editor"
+    "on-click": "omakeb-launch-tui nmtui connect"
   },
 
   "cpu": {

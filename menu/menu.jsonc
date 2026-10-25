@@ -146,7 +146,7 @@
   "setup.audio.hwmixer":  {"icon":"󰆍","label":"Hardware mixer (alsamixer)","when":"command -v alsamixer >/dev/null","action":"omakeb-launch-tui alsamixer"},
 
   "setup.network.editor": {"icon":"󰛳","label":"Connections","when":"command -v nm-connection-editor >/dev/null","action":"omakeb-launch-once nm-connection-editor"},
-  "setup.network.tui":    {"icon":"󰢩","label":"Connections (terminal)","when":"command -v nmtui >/dev/null","action":"omakeb-launch-tui nmtui"},
+  "setup.network.tui":    {"icon":"󰢩","label":"Connections (terminal)","when":"command -v nmtui >/dev/null","action":"omakeb-launch-tui nmtui connect"},
 
   "setup.bluetooth.manager": {"icon":"󰂯","label":"Devices","when":"command -v blueman-manager >/dev/null","action":"omakeb-launch-once blueman-manager"},
   "setup.bluetooth.tui":     {"icon":"󰆍","label":"Devices (terminal)","action":"omakeb-launch-tui bluetoothctl"},
