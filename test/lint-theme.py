@@ -244,6 +244,8 @@ def check_render(label, theme_dir, palette):
                     "background — an invisible highlight with no error"
                     % (label, name))
 
+    check_prompt(label, outdir)
+
     # The two guarded derivations, asserted on the palette rather than on a
     # rendered file so the failure names the cause.
     if palette:
@@ -256,7 +258,67 @@ def check_render(label, theme_dir, palette):
 
 
 # ---------------------------------------------------------------------------
-# 4. The two-sources-of-truth guard
+# 4. The prompt composition
+# ---------------------------------------------------------------------------
+
+# Words a starship style string may hold that are not palette roles.
+STARSHIP_STYLE_WORDS = set("""
+    bold italic underline dimmed inverted blink hidden strikethrough none
+    black red green yellow blue purple cyan white
+    bright-black bright-red bright-green bright-yellow bright-blue
+    bright-purple bright-cyan bright-white prev_fg prev_bg
+""".split())
+
+
+def check_prompt(label, outdir):
+    """The default prompt layout plus the palette must be one valid starship.toml.
+
+    omakeb-theme-set composes them (prompt_compose in lib/theme.sh): layout,
+    then the palette unless the layout defines [palettes.omakeb] itself. The
+    shipped layout must NOT define it — then the theme's colours would never
+    reach the prompt — and every role it names must be in the palette, because
+    starship treats an unknown colour name as no colour, with no error.
+    """
+    try:
+        import tomllib
+    except ImportError:  # python < 3.11: nothing to parse with, skip quietly
+        return
+    layout_path = os.path.join(outdir, "starship.toml")
+    palette_path = os.path.join(outdir, "starship-palette.toml")
+    with open(layout_path, encoding="utf-8") as fh:
+        layout = fh.read()
+    with open(palette_path, encoding="utf-8") as fh:
+        fragment = fh.read()
+    if re.search(r"^\s*\[palettes\.omakeb\]", layout, re.M):
+        bad("%s/starship.toml: the layout defines [palettes.omakeb] itself, so "
+            "the theme's palette is never appended" % label)
+        return
+    try:
+        config = tomllib.loads(layout + "\n" + fragment)
+    except tomllib.TOMLDecodeError as exc:
+        bad("%s: layout + palette is not valid TOML: %s" % (label, exc))
+        return
+    if config.get("palette") != "omakeb":
+        bad("%s/starship.toml: the layout does not select palette \"omakeb\""
+            % label)
+    roles = set(config.get("palettes", {}).get("omakeb", {}))
+
+    used = set()
+    for match in re.finditer(r'^\s*\w*style\s*=\s*"([^"]*)"', layout, re.M):
+        used.update(match.group(1).split())
+    for match in re.finditer(r"\]\(([^)]*)\)", layout):
+        used.update(match.group(1).split())
+    for word in sorted(used):
+        word = word.split(":", 1)[-1]
+        if word.startswith(("#", "$")) or word in STARSHIP_STYLE_WORDS:
+            continue
+        if word not in roles:
+            bad("%s/starship.toml: style names %r, which the omakeb palette "
+                "does not define" % (label, word))
+
+
+# ---------------------------------------------------------------------------
+# 5. The two-sources-of-truth guard
 # ---------------------------------------------------------------------------
 
 def check_no_stray_colours():

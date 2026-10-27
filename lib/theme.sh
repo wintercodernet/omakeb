@@ -108,6 +108,110 @@ theme_render() {
   python3 "$OMAKEB_THEME_PY" render "$dir" "$outdir" "${templates[@]}" >/dev/null
 }
 
+# --- prompt layouts -----------------------------------------------------------
+#
+# The theme decides the prompt's COLOURS; the prompt layout decides its SHAPE,
+# and the two are chosen separately. A layout is a starship config, from one of
+# three places, first match wins:
+#
+#   omakeb                            templates/starship.toml.tpl, rendered
+#   $OMAKEB_CONFIG/prompts/<name>.toml  the user's own, shadowing the rest
+#   `starship preset <name>`          the presets starship itself ships
+#
+# Whatever the layout, omakeb-theme-set appends the rendered `omakeb` palette to
+# it, so a layout that says `palette = "omakeb"` follows the theme. Presets that
+# use ANSI colour names (red, blue, ...) follow it anyway, through kitty's
+# color0..15; the few that hardcode #rrggbb do not, and prompt_fixed_colours
+# says which.
+
+OMAKEB_PROMPT_DEFAULT=omakeb
+
+# Always exits 0, for the same reason as theme_current.
+prompt_current() {
+  state_get prompt
+}
+
+prompt_presets() {
+  command -v starship >/dev/null 2>&1 || return 0
+  starship preset --list 2>/dev/null || true
+}
+
+# prompt_names — every available layout, the default first, then the rest
+# sorted. Same name rule as themes: a name reaches a path and a command line.
+prompt_names() {
+  local f name
+  printf '%s\n' "$OMAKEB_PROMPT_DEFAULT"
+  {
+    for f in "$OMAKEB_CONFIG/prompts"/*.toml; do
+      [[ -f $f ]] || continue
+      basename "$f" .toml
+    done
+    prompt_presets
+  } 2>/dev/null | while IFS= read -r name; do
+    theme_name_ok "$name" && [[ $name != "$OMAKEB_PROMPT_DEFAULT" ]] && printf '%s\n' "$name"
+  done | sort -u
+  return 0
+}
+
+# prompt_source <name> — "default", "user" or "preset"; fails if unknown.
+prompt_source() {
+  local name=$1
+  theme_name_ok "$name" || return 1
+  if [[ -f "$OMAKEB_CONFIG/prompts/$name.toml" ]]; then
+    echo user
+  elif [[ $name == "$OMAKEB_PROMPT_DEFAULT" ]]; then
+    echo default
+  elif prompt_presets | grep -qxF -- "$name"; then
+    echo preset
+  else
+    return 1
+  fi
+}
+
+# prompt_layout <name> <rendered-dir> — the layout's TOML on stdout. The default
+# layout is the rendered template, so it needs the staging directory.
+prompt_layout() {
+  local name=$1 rendered=$2 kind
+  kind=$(prompt_source "$name") || return 1
+  case $kind in
+    user)    cat "$OMAKEB_CONFIG/prompts/$name.toml" ;;
+    default) cat "$rendered/starship.toml" ;;
+    preset)  starship preset "$name" ;;
+  esac
+}
+
+# prompt_fixed_colours <name> — succeeds when the layout writes its own hex
+# colours, i.e. will look the same whatever the theme. Only meaningful for
+# presets and user layouts; the default uses the palette throughout.
+prompt_fixed_colours() {
+  local name=$1 kind
+  kind=$(prompt_source "$name") || return 1
+  case $kind in
+    user)   grep -v '^[[:space:]]*#' "$OMAKEB_CONFIG/prompts/$name.toml" ;;
+    preset) starship preset "$name" 2>/dev/null | grep -v '^[[:space:]]*#' ;;
+    *)      return 1 ;;
+  esac | grep -qE "#[0-9a-fA-F]{6}"
+}
+
+# prompt_compose <name> <rendered-dir> — replace <rendered-dir>/starship.toml
+# with the chosen layout plus the palette, and drop the palette fragment, which
+# is not a config file of its own. A layout that already defines
+# [palettes.omakeb] keeps its own: TOML refuses a table defined twice.
+prompt_compose() {
+  local name=$1 rendered=$2 layout
+  layout=$(prompt_layout "$name" "$rendered") || return 1
+  [[ -n $layout ]] || return 1
+  {
+    printf '%s\n' "$layout"
+    if ! grep -q '^[[:space:]]*\[palettes\.omakeb\]' <<<"$layout"; then
+      printf '\n'
+      cat "$rendered/starship-palette.toml"
+    fi
+  } > "$rendered/starship.toml.next" &&
+    mv "$rendered/starship.toml.next" "$rendered/starship.toml" &&
+    rm -f "$rendered/starship-palette.toml"
+}
+
 # --- import -------------------------------------------------------------------
 #
 # THE ALLOWLIST IS THE SECURITY MODEL, and it is the opposite of upstream's.

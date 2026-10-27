@@ -78,6 +78,22 @@ if ! theme_render "$dir" "$staging"; then
 The partial output is in $staging for inspection."
 fi
 
+# The prompt layout is chosen separately (omakeb-prompt-set) and composed with
+# this theme's palette here, before promotion, so it is all-or-nothing too. A
+# recorded layout that has since gone — a deleted user file, a preset a newer
+# starship dropped — falls back to the default rather than blocking a theme
+# change over the prompt.
+prompt=$(prompt_current)
+[[ -n $prompt ]] || prompt=$OMAKEB_PROMPT_DEFAULT
+if ! prompt_source "$prompt" >/dev/null; then
+  log_warn "prompt layout '$prompt' is gone; using $OMAKEB_PROMPT_DEFAULT"
+  prompt=$OMAKEB_PROMPT_DEFAULT
+fi
+if ! prompt_compose "$prompt" "$staging"; then
+  die "prompt layout $prompt did not compose; nothing has been changed.
+The partial output is in $staging for inspection."
+fi
+
 # Promote. Not a true atomic rename — a directory cannot be renamed over a
 # populated one — but nothing reads current/theme except the copy step below, so
 # the window is not observable. What the staging dance actually buys is the

@@ -1,0 +1,50 @@
+#!/bin/bash
+
+# omakeb:summary=List the available shell prompt layouts.
+# omakeb:args=[--long | --annotate]
+
+# Plain names on stdout, one per line, so this pipes straight into fuzzel.
+#
+# `--annotate` appends "  (fixed colours)" to a layout that hardcodes its own
+# colours and so ignores the theme. That suffix is for a picker to display and
+# strip (everything after the first space); a name never contains a space.
+#
+# `--long` is the table for a human: active marker, name, where it comes from,
+# and whether its colours follow the theme.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+mode=${1:-}
+case $mode in
+  ''|--long|--annotate) ;;
+  *) die "usage: omakeb-prompt-list [--long | --annotate]" ;;
+esac
+
+if [[ -z $mode ]]; then
+  prompt_names
+  exit 0
+fi
+
+current=$(prompt_current)
+[[ -n $current ]] || current=$OMAKEB_PROMPT_DEFAULT
+
+# Same leading-marker layout as omakeb-theme-list, for the same reason.
+[[ $mode == --long ]] && printf '%s %-22s %-8s %s\n' ' ' NAME SOURCE COLOURS
+while IFS= read -r name; do
+  [[ -n $name ]] || continue
+  colours=theme
+  prompt_fixed_colours "$name" && colours=fixed
+  if [[ $mode == --annotate ]]; then
+    if [[ $colours == fixed ]]; then
+      printf '%s  (fixed colours)\n' "$name"
+    else
+      printf '%s\n' "$name"
+    fi
+    continue
+  fi
+  active=' '
+  [[ $name == "$current" ]] && active='✓'
+  printf '%s %-22s %-8s %s\n' "$active" "$name" "$(prompt_source "$name")" "$colours"
+done < <(prompt_names)

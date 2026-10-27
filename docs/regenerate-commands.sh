@@ -14,7 +14,7 @@ group_of() {
   case "${1#omakeb-}" in
     launch-*|system-lock|system-lid) echo "Launching things" ;;
     menu*)                           echo "Menus and pickers" ;;
-    theme-*)                         echo "Themes" ;;
+    theme-*|prompt-*)                echo "Themes" ;;
     install-app)                     echo "Optional software" ;;
     toggle-*|nightlight-apply)       echo "Toggles" ;;
     capture-*|clipboard)             echo "Capture and clipboard" ;;

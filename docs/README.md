@@ -20,12 +20,12 @@ Five things, roughly in the order they matter:
 and wired together, with 141 keybindings and a set of window rules. This is the
 part you look at.
 
-**2. A menu.** One keypress (`SUPER+SPACE`) opens a tree of 88 entries covering
+**2. A menu.** One keypress (`SUPER+SPACE`) opens a tree of 89 entries covering
 everything below: launching apps, changing themes, capture, toggles, system
 power. Defined as *data* in `menu/menu.jsonc`, walked by a script that renders
 each level through fuzzel.
 
-**3. Commands.** 39 small scripts in `bin/`, each doing one thing. They are the
+**3. Commands.** 42 small scripts in `bin/`, each doing one thing. They are the
 project's public API — the keybindings and the menu both just call them, and so
 can you. See [commands.md](commands.md).
 
@@ -250,8 +250,21 @@ waybar.css  mako.ini  fuzzel.ini  kitty.conf  hyprland-colors.conf
 hyprlock.conf  btop.theme  gtk.css  starship.toml
 ```
 
+(A tenth, `starship-palette.toml`, is not a config of its own: it is the
+palette appended to the chosen prompt layout, below.)
+
 Adding a theme is one `colors.toml`. Adding a *themed app* is one template.
 Neither requires touching the other.
+
+The shell prompt is starship, and its **layout** is a separate choice from the
+theme: `omakeb-prompt-set <layout>` (or `SUPER+SPACE` → Style → Prompt) picks
+`omakeb`, one of starship's built-in presets, or a file of your own in
+`~/.config/omakeb/prompts/<name>.toml`. The theme's colours are appended to
+whichever layout you choose as a starship palette named `omakeb` (`accent`,
+`muted`, `warning`, `urgent`, `ok`, `info`, `dim`, `foreground`), so a layout
+that sets `palette = "omakeb"` keeps following the theme. Presets written in
+ANSI colour names follow it through the terminal; the few that hardcode their
+own colours do not, and `omakeb-prompt-list --long` says which.
 
 `omakeb-theme-install <git-url>` imports palettes from the Omarchy community
 ecosystem — the palette only. Theme repos are arbitrary third-party content, so
@@ -266,7 +279,7 @@ boot.sh              curl|bash entry point
 install.sh           orchestrator
 install/             the ten steps above
 lib/                 shared shell helpers, sourced by everything
-bin/                 39 commands — the public API
+bin/                 42 commands — the public API
 default/             our config; regenerated on update
 config/              seed files copied once into ~/.config/omakeb
 packages/            the 82 base packages, as plain lists

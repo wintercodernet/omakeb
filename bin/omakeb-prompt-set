@@ -1,0 +1,57 @@
+#!/bin/bash
+
+# omakeb:summary=Choose the shell prompt's layout; its colours still follow the theme.
+# omakeb:args=[layout]
+
+# A layout is a starship config: `omakeb` (the default), one of starship's own
+# presets, or a file of yours in ~/.config/omakeb/prompts/<name>.toml. See
+# omakeb-prompt-list for what is available.
+#
+# This only records the choice and re-runs omakeb-theme-set, which is the one
+# place that writes ~/.config/starship.toml. Two writers would mean a theme
+# change quietly reverting the prompt, or the other way round. With no layout
+# named it re-applies the current one.
+#
+# --no-reload on the theme step: starship reads its config at every prompt, so
+# the next prompt drawn already has the new layout, and nothing else the theme
+# writes has changed. Bouncing waybar and Hyprland for a prompt would be noise.
+
+set -euo pipefail
+OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+source "$OMAKEB_PATH/lib/all.sh"
+
+case ${1:-} in
+  -h|--help)
+    echo "usage: omakeb-prompt-set [layout]"
+    echo
+    echo "Layouts:"; prompt_names | sed 's/^/  /'
+    echo
+    echo "Add your own as $OMAKEB_CONFIG/prompts/<name>.toml"
+    exit 0 ;;
+  -*) die "unknown option: $1" ;;
+esac
+
+command -v starship >/dev/null 2>&1 || die "starship is not installed"
+
+name=${1:-}
+if [[ -z $name ]]; then
+  name=$(prompt_current)
+  [[ -n $name ]] || name=$OMAKEB_PROMPT_DEFAULT
+fi
+
+prompt_source "$name" >/dev/null || die "no such prompt layout: $name
+Available:
+$(prompt_names | sed 's/^/  /')"
+
+state_set prompt "$name"
+"$OMAKEB_PATH/bin/omakeb-theme-set" --no-reload
+
+if prompt_fixed_colours "$name"; then
+  log_info "$name sets its own colours; it will not change with the theme."
+fi
+
+notify-send -a omakeb -i utilities-terminal \
+  -h string:x-canonical-private-synchronous:omakeb-prompt \
+  "Prompt" "$name" 2>/dev/null || true
+
+log_done "prompt set to $name. Open shells pick it up at their next prompt."

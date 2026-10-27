@@ -103,6 +103,10 @@
   // themes with the user's, with the user's shadowing ours by name — so an
   // imported theme shows up here with no further wiring.
   "style.theme":       {"icon":"󰸌","label":"Theme","aliases":["theme","themes"],"when":"command -v omakeb-theme-set >/dev/null","action":"t=$(omakeb-theme-list | fuzzel --dmenu --prompt='Theme  ') && [[ -n $t ]] && omakeb-theme-set \"$t\""},
+  // The prompt's layout, separate from its colours. --annotate marks layouts
+  // that hardcode their own colours; the marker is stripped before the name is
+  // used, and a name never contains a space.
+  "style.prompt":      {"icon":"󰆍","label":"Prompt","aliases":["prompt","starship"],"when":"command -v omakeb-prompt-set >/dev/null && command -v starship >/dev/null","action":"p=$(omakeb-prompt-list --annotate | fuzzel --dmenu --prompt='Prompt  ') && p=${p%% *} && [[ -n $p ]] && omakeb-prompt-set \"$p\""},
   "style.background":  {"icon":"󰋩","label":"Background","aliases":["background","wallpaper"],"when":"shopt -s nullglob; bgs=(\"$OMAKEB_CONFIG\"/themes/*/backgrounds/* \"$OMAKEB_PATH\"/themes/*/backgrounds/*); (( ${#bgs[@]} ))","action":"shopt -s nullglob; bgs=(\"$OMAKEB_CONFIG\"/themes/*/backgrounds/* \"$OMAKEB_PATH\"/themes/*/backgrounds/*); bg=$(printf '%s\\n' \"${bgs[@]}\" | sort | fuzzel --dmenu --prompt='Background  ') && [[ -n $bg ]] && hyprctl hyprpaper preload \"$bg\" && hyprctl hyprpaper wallpaper \",$bg\""},
 
   // Palette only, and the import says so: a third-party theme's waybar.css,

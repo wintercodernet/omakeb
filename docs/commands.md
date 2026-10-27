@@ -28,13 +28,15 @@ typed by hand.
 
 ## Themes
 
+- **`omakeb-prompt-list`** `[--long | --annotate]` — List the available shell prompt layouts.
+- **`omakeb-prompt-set`** `[layout]` — Choose the shell prompt's layout; its colours still follow the theme.
 - **`omakeb-theme-install`** `<git-url|path> [name]` — Install a theme from a git URL or a local directory.
 - **`omakeb-theme-list`** `[--long]` — List the installed themes.
 - **`omakeb-theme-set`** `[--no-reload] [theme]` — Switch the desktop theme and reload every themed app in place.
 
 ## Optional software
 
-- **`omakeb-install-app`** `[list|install [app]|remove [app]] (no app name opens a picker)` — Install or remove optional software from apps/.
+- **`omakeb-install-app`** `[list|install [app]|remove [app]|upgrade [app]] (no app name opens a picker; upgrade with none checks every tier-3 app)` — Install or remove optional software from apps/.
 
 ## Toggles
 
@@ -68,5 +70,6 @@ typed by hand.
 - **`omakeb-hyprland-window-pop`** — Pop the active window out: float it, pin it and centre it.
 - **`omakeb-monitor-apply`** — Put every display on its best mode, and scale a display above 4K by 2.
 - **`omakeb-monitor-watch`** — Repair the bar after a display hotplug leaves duplicate copies stacked at the top. (internal)
+- **`omakeb-session-daemons`** — Start the session daemons that systemd did not start.
 - **`omakeb-update`** `[--no-pull] [--no-converge] [--no-upgrade]` — Pull the latest omakeb, apply migrations, and reconverge this machine.
 
