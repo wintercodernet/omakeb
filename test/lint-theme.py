@@ -270,41 +270,59 @@ STARSHIP_STYLE_WORDS = set("""
 """.split())
 
 
+PROMPTS = os.path.join(ROOT, "prompts")
+
+
+def shipped_prompts():
+    if not os.path.isdir(PROMPTS):
+        return []
+    return sorted(os.path.join(PROMPTS, f) for f in os.listdir(PROMPTS)
+                  if f.endswith(".toml"))
+
+
 def check_prompt(label, outdir):
-    """The default prompt layout plus the palette must be one valid starship.toml.
+    """Every shipped prompt layout plus the palette must be one valid starship.toml.
 
     omakeb-theme-set composes them (prompt_compose in lib/theme.sh): layout,
-    then the palette unless the layout defines [palettes.omakeb] itself. The
-    shipped layout must NOT define it — then the theme's colours would never
-    reach the prompt — and every role it names must be in the palette, because
-    starship treats an unknown colour name as no colour, with no error.
+    then the palette unless the layout defines [palettes.omakeb] itself. Ours
+    must NOT define it — then the theme's colours would never reach the prompt
+    — must select it, must write no #rrggbb of their own, and every role they
+    name must be in the palette, because starship treats an unknown colour name
+    as no colour, with no error.
     """
+    with open(os.path.join(outdir, "starship-palette.toml"), encoding="utf-8") as fh:
+        fragment = fh.read()
+    layouts = [("starship.toml", os.path.join(outdir, "starship.toml"))]
+    layouts += [("prompts/" + os.path.basename(p), p) for p in shipped_prompts()]
+    for name, path in layouts:
+        with open(path, encoding="utf-8") as fh:
+            check_prompt_layout("%s/%s" % (label, name), fh.read(), fragment)
+
+
+def check_prompt_layout(where, layout, fragment):
     try:
         import tomllib
     except ImportError:  # python < 3.11: nothing to parse with, skip quietly
         return
-    layout_path = os.path.join(outdir, "starship.toml")
-    palette_path = os.path.join(outdir, "starship-palette.toml")
-    with open(layout_path, encoding="utf-8") as fh:
-        layout = fh.read()
-    with open(palette_path, encoding="utf-8") as fh:
-        fragment = fh.read()
     if re.search(r"^\s*\[palettes\.omakeb\]", layout, re.M):
-        bad("%s/starship.toml: the layout defines [palettes.omakeb] itself, so "
-            "the theme's palette is never appended" % label)
+        bad("%s: the layout defines [palettes.omakeb] itself, so the theme's "
+            "palette is never appended" % where)
         return
+    for lineno, line in enumerate(layout.splitlines(), 1):
+        if not line.lstrip().startswith("#") and HEX.search(line):
+            bad("%s:%d: a fixed colour in a shipped layout; name a palette role "
+                "so it follows the theme" % (where, lineno))
     try:
         config = tomllib.loads(layout + "\n" + fragment)
     except tomllib.TOMLDecodeError as exc:
-        bad("%s: layout + palette is not valid TOML: %s" % (label, exc))
+        bad("%s: layout + palette is not valid TOML: %s" % (where, exc))
         return
     if config.get("palette") != "omakeb":
-        bad("%s/starship.toml: the layout does not select palette \"omakeb\""
-            % label)
+        bad("%s: the layout does not select palette \"omakeb\"" % where)
     roles = set(config.get("palettes", {}).get("omakeb", {}))
 
     used = set()
-    for match in re.finditer(r'^\s*\w*style\s*=\s*"([^"]*)"', layout, re.M):
+    for match in re.finditer(r'^\s*\w*style\w*\s*=\s*"([^"]*)"', layout, re.M):
         used.update(match.group(1).split())
     for match in re.finditer(r"\]\(([^)]*)\)", layout):
         used.update(match.group(1).split())
@@ -313,8 +331,8 @@ def check_prompt(label, outdir):
         if word.startswith(("#", "$")) or word in STARSHIP_STYLE_WORDS:
             continue
         if word not in roles:
-            bad("%s/starship.toml: style names %r, which the omakeb palette "
-                "does not define" % (label, word))
+            bad("%s: style names %r, which the omakeb palette does not define"
+                % (where, word))
 
 
 # ---------------------------------------------------------------------------

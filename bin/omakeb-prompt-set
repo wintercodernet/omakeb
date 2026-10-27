@@ -3,9 +3,10 @@
 # omakeb:summary=Choose the shell prompt's layout; its colours still follow the theme.
 # omakeb:args=[layout]
 
-# A layout is a starship config: `omakeb` (the default), one of starship's own
-# presets, or a file of yours in ~/.config/omakeb/prompts/<name>.toml. See
-# omakeb-prompt-list for what is available.
+# A layout is a starship config: one of ours (`darkgreen`, the default, or
+# `omakeb`), one of starship's own presets, or a file of yours in
+# ~/.config/omakeb/prompts/<name>.toml. See omakeb-prompt-list for what is
+# available.
 #
 # This only records the choice and re-runs omakeb-theme-set, which is the one
 # place that writes ~/.config/starship.toml. Two writers would mean a theme

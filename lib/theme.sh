@@ -112,10 +112,11 @@ theme_render() {
 #
 # The theme decides the prompt's COLOURS; the prompt layout decides its SHAPE,
 # and the two are chosen separately. A layout is a starship config, from one of
-# three places, first match wins:
+# four places, first match wins:
 #
-#   omakeb                            templates/starship.toml.tpl, rendered
 #   $OMAKEB_CONFIG/prompts/<name>.toml  the user's own, shadowing the rest
+#   omakeb                            templates/starship.toml.tpl, rendered
+#   $OMAKEB_PATH/prompts/<name>.toml  ours, shipped
 #   `starship preset <name>`          the presets starship itself ships
 #
 # Whatever the layout, omakeb-theme-set appends the rendered `omakeb` palette to
@@ -124,7 +125,13 @@ theme_render() {
 # color0..15; the few that hardcode #rrggbb do not, and prompt_fixed_colours
 # says which.
 
-OMAKEB_PROMPT_DEFAULT=omakeb
+# The layout a machine gets when it has never chosen one. Until darkgreen this
+# was `omakeb`, and migrations/1793059200.sh records that explicitly on every
+# machine installed before the change, so their prompt does not move under them.
+OMAKEB_PROMPT_DEFAULT=darkgreen
+
+# The one layout rendered from a template rather than read from a file.
+OMAKEB_PROMPT_TEMPLATE=omakeb
 
 # Always exits 0, for the same reason as theme_current.
 prompt_current() {
@@ -142,7 +149,8 @@ prompt_names() {
   local f name
   printf '%s\n' "$OMAKEB_PROMPT_DEFAULT"
   {
-    for f in "$OMAKEB_CONFIG/prompts"/*.toml; do
+    printf '%s\n' "$OMAKEB_PROMPT_TEMPLATE"
+    for f in "$OMAKEB_CONFIG/prompts"/*.toml "$OMAKEB_PATH/prompts"/*.toml; do
       [[ -f $f ]] || continue
       basename "$f" .toml
     done
@@ -153,14 +161,14 @@ prompt_names() {
   return 0
 }
 
-# prompt_source <name> — "default", "user" or "preset"; fails if unknown.
+# prompt_source <name> — "user", "shipped" or "preset"; fails if unknown.
 prompt_source() {
   local name=$1
   theme_name_ok "$name" || return 1
   if [[ -f "$OMAKEB_CONFIG/prompts/$name.toml" ]]; then
     echo user
-  elif [[ $name == "$OMAKEB_PROMPT_DEFAULT" ]]; then
-    echo default
+  elif [[ $name == "$OMAKEB_PROMPT_TEMPLATE" || -f "$OMAKEB_PATH/prompts/$name.toml" ]]; then
+    echo shipped
   elif prompt_presets | grep -qxF -- "$name"; then
     echo preset
   else
@@ -168,21 +176,26 @@ prompt_source() {
   fi
 }
 
-# prompt_layout <name> <rendered-dir> — the layout's TOML on stdout. The default
-# layout is the rendered template, so it needs the staging directory.
+# prompt_layout <name> <rendered-dir> — the layout's TOML on stdout. The
+# template layout is already rendered, so it needs the staging directory.
 prompt_layout() {
   local name=$1 rendered=$2 kind
   kind=$(prompt_source "$name") || return 1
   case $kind in
     user)    cat "$OMAKEB_CONFIG/prompts/$name.toml" ;;
-    default) cat "$rendered/starship.toml" ;;
+    shipped)
+      if [[ $name == "$OMAKEB_PROMPT_TEMPLATE" ]]; then
+        cat "$rendered/starship.toml"
+      else
+        cat "$OMAKEB_PATH/prompts/$name.toml"
+      fi ;;
     preset)  starship preset "$name" ;;
   esac
 }
 
 # prompt_fixed_colours <name> — succeeds when the layout writes its own hex
-# colours, i.e. will look the same whatever the theme. Only meaningful for
-# presets and user layouts; the default uses the palette throughout.
+# colours, i.e. will look the same whatever the theme. The template layout uses
+# the palette throughout, and test/lint-theme.py holds the shipped files to that.
 prompt_fixed_colours() {
   local name=$1 kind
   kind=$(prompt_source "$name") || return 1

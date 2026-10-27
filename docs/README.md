@@ -258,8 +258,10 @@ Neither requires touching the other.
 
 The shell prompt is starship, and its **layout** is a separate choice from the
 theme: `omakeb-prompt-set <layout>` (or `SUPER+SPACE` → Style → Prompt) picks
-`omakeb`, one of starship's built-in presets, or a file of your own in
-`~/.config/omakeb/prompts/<name>.toml`. The theme's colours are appended to
+one of ours, one of starship's built-in presets, or a file of your own in
+`~/.config/omakeb/prompts/<name>.toml`. A new install gets `darkgreen`, the
+two-line bracketed shape of oh-my-posh's darkblood in the theme's green;
+`omakeb` is the compact single-line one machines installed earlier keep. The theme's colours are appended to
 whichever layout you choose as a starship palette named `omakeb` (`accent`,
 `muted`, `warning`, `urgent`, `ok`, `info`, `dim`, `foreground`), so a layout
 that sets `palette = "omakeb"` keeps following the theme. Presets written in
@@ -286,6 +288,7 @@ packages/            the 82 base packages, as plain lists
 apps/                optional software, one file each
 themes/              palettes
 templates/           one per themed app
+prompts/             shipped starship prompt layouts
 menu/menu.jsonc      the whole menu tree, as data
 test/                see below
 docs/                you are here

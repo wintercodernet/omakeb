@@ -1,0 +1,55 @@
+# omakeb — the "darkgreen" prompt layout, the default on a new install.
+#
+# The shape of oh-my-posh's darkblood theme, redrawn for starship and coloured
+# from the theme instead of a fixed #CB4B16: the brackets and the box-drawing
+# corners are the palette's `ok` role (the theme's green), the values inside
+# them are `foreground`.
+#
+#   ┏[user][ main][][x1]
+#   ┖[~/code/omakeb]> _
+#
+# The branch appears only in a git repository, the bolt only as root, and the
+# exit status only when the last command failed — as in the original.
+#
+# Shipped, not user-owned: edits here are overwritten on update. Copy it to
+# ~/.config/omakeb/prompts/<name>.toml and `omakeb-prompt-set <name>` instead.
+# `palette = "omakeb"` is what ties it to the theme; omakeb-theme-set appends
+# that palette when it writes ~/.config/starship.toml.
+
+format = """
+[┏\\[](ok)$username[\\]](ok)$git_branch${custom.root}$status
+[┖\\[](ok)$directory[\\]>](ok) """
+add_newline = false
+palette = "omakeb"
+
+[username]
+show_always = true
+format = "[$user]($style)"
+style_user = "foreground"
+style_root = "foreground"
+
+[git_branch]
+format = "[\\[](ok)[$symbol$branch]($style)[\\]](ok)"
+style = "foreground"
+
+# starship has no root segment. `when` runs in a bare bash, where EUID is set
+# by bash itself, so this costs one fork per prompt and reads no rc file.
+[custom.root]
+when = '[ "$EUID" -eq 0 ]'
+shell = ["bash", "--noprofile", "--norc"]
+symbol = ""
+format = "[\\[](ok)[$symbol](foreground)[\\]](ok)"
+
+# darkblood prints the reason for the code; $common_meaning and $signal_name
+# are starship's equivalent, and $maybe_int is the number when neither applies.
+[status]
+disabled = false
+format = "[\\[x](ok)[$common_meaning$signal_name$maybe_int]($style)[\\]](ok)"
+style = "foreground"
+
+# The full path, home shown as ~, as darkblood's `style: full` does.
+[directory]
+format = "[$path]($style)"
+style = "foreground"
+truncation_length = 0
+truncate_to_repo = false
