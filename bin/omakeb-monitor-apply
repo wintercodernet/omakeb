@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# omakeb:summary=Put every display on its best mode, and scale a display above 4K by 2.
+# omakeb:summary=Put every display on its best mode, scale a display above 4K by 2, and centre the main window on a wide one.
 
 # Hyprland's shipped default is `monitor = , preferred, auto, auto`, and
 # `preferred` is the EDID's own preferred mode — which is not the best one a
@@ -19,6 +19,20 @@
 # sourced last precisely so it wins; a runtime helper that overrode it half a
 # second after login would make it useless. A catch-all rule (`monitor = , ...`)
 # counts as covering every output, so one line opts out of the whole policy.
+#
+# LAYOUT. A display at least CENTER_MASTER_WIDTH logical pixels wide gets the
+# master layout with the master column centred, via a workspace rule scoped to
+# that output (`m[DP-1]`). Under dwindle, an even split on a wide display puts
+# most windows at the edges, while the natural way to work on one is a main
+# window in the middle with the rest beside it. The width is LOGICAL, so it is
+# measured after scaling: an 8K panel at scale 2 is 3840 wide and qualifies, a
+# 5K panel at scale 2 (2560) does not, and a 3440x1440 ultrawide just does.
+#
+# It is the same "hyprlang has no conditionals" problem as scale, and like the
+# monitor rules these are runtime keywords, which `hyprctl reload` discards.
+# omakeb-monitor-watch re-runs this script after a reload for that reason.
+# A `workspace = ..., layout:...` rule in ~/.config/omakeb/hyprland.conf opts
+# out of the layout half, and so does OMAKEB_CENTER_MASTER_WIDTH=0.
 
 set -uo pipefail
 OMAKEB_PATH="${OMAKEB_PATH:-$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
@@ -37,6 +51,19 @@ OVER_4K_WIDTH=${OMAKEB_OVER_4K_WIDTH:-4096}
 # a fractional scale is the sensible answer.
 OVER_4K_SCALE=${OMAKEB_OVER_4K_SCALE:-2}
 
+# Logical width from which a display gets the centred master layout. 3440 is the
+# narrowest common ultrawide, and three columns are still a usable width there.
+CENTER_MASTER_WIDTH=${OMAKEB_CENTER_MASTER_WIDTH:-3440}
+
+# A mode change is not visible in `hyprctl monitors` straight away, and the
+# layout pass needs the new logical width. Seconds to wait after applying one.
+MODE_SETTLE=${OMAKEB_MONITOR_APPLY_SETTLE:-2}
+
+# Outputs this session has centred. A workspace rule outlives the display it was
+# written for, so when a narrower one later turns up under the same connector
+# name the rule has to be taken back, and only our own rules may be.
+centred_list="${XDG_RUNTIME_DIR:-$OMAKEB_STATE}/omakeb-center-master"
+
 have() { command -v "$1" >/dev/null 2>&1; }
 for tool in hyprctl jq; do
   have "$tool" || { log_warn "omakeb-monitor-apply: $tool is missing"; exit 0; }
@@ -53,6 +80,15 @@ user_ruled_outputs() {
   sed 's/#.*//' "$f" |
     sed -n 's/^[[:space:]]*monitor[[:space:]]*=[[:space:]]*\([^,]*\).*/\1/p' |
     sed 's/[[:space:]]*$//'
+}
+
+# Whether the user routes workspaces to layouts themselves. Any such rule opts
+# out of the layout policy entirely: theirs and ours would both match the same
+# workspaces, and a runtime keyword would quietly beat the file.
+user_layout_rules() {
+  local f="$OMAKEB_CONFIG/hyprland.conf"
+  [[ -r $f ]] || return 1
+  sed 's/#.*//' "$f" | grep -Eq '^[[:space:]]*workspace[[:space:]]*=.*layout:'
 }
 
 # Best mode: most pixels, and among those the highest refresh. Not left to
@@ -88,6 +124,8 @@ unset _line
 monitors=$(hyprctl monitors -j 2>/dev/null) || exit 0
 count=$(printf '%s' "$monitors" | jq 'length')
 [[ ${count:-0} -gt 0 ]] || exit 0
+
+applied=0
 
 for i in $(seq 0 $((count - 1))); do
   mon=$(printf '%s' "$monitors" | jq ".[$i]")
@@ -133,7 +171,80 @@ for i in $(seq 0 $((count - 1))); do
 
   if hyprctl keyword monitor "$name,$mode,auto,$scale" >/dev/null 2>&1; then
     log_ok "$name: $mode, scale $scale"
+    applied=1
   else
     log_warn "$name: could not apply $mode at scale $scale"
   fi
 done
+
+# --- layout -------------------------------------------------------------------
+if [[ ! $CENTER_MASTER_WIDTH =~ ^[0-9]+$ ]] || (( CENTER_MASTER_WIDTH == 0 )); then
+  exit 0
+fi
+if user_layout_rules; then
+  log_skip "layout: a workspace layout rule in ${OMAKEB_CONFIG/#$HOME/\~}/hyprland.conf takes precedence"
+  exit 0
+fi
+
+(( applied )) && sleep "$MODE_SETTLE"
+monitors=$(hyprctl monitors -j 2>/dev/null) || exit 0
+workspaces=$(hyprctl workspaces -j 2>/dev/null) || workspaces='[]'
+
+# What a display that is no longer wide goes back to: whatever the config says.
+default_layout=$(hyprctl -j getoption general:layout 2>/dev/null | jq -r '.str // empty' 2>/dev/null)
+[[ -n $default_layout ]] || default_layout=dwindle
+
+previously=()
+if [[ -r $centred_list ]]; then
+  while IFS= read -r _line; do
+    [[ -n $_line ]] && previously+=("$_line")
+  done < "$centred_list"
+  unset _line
+fi
+
+# One row per output: name, logical width, and the layout its active workspace
+# runs now (only used to keep the log quiet when nothing changes). A rotated
+# output (odd transform) is as wide as its mode is tall.
+rows=$(printf '%s' "$monitors" | jq -r --argjson ws "$workspaces" '
+  .[] | . as $m
+  | (if ((.transform // 0) % 2) == 1 then .height else .width end) as $px
+  | [ .name,
+      (($px / (if (.scale // 0) > 0 then .scale else 1 end)) | floor | tostring),
+      ([ $ws[] | select(.id == ($m.activeWorkspace.id // -1)) | .tiledLayout // "" ] | first // "") ]
+  | @tsv')
+
+centred=()
+while IFS=$'\t' read -r name width current; do
+  [[ -n $name ]] || continue
+
+  if (( width >= CENTER_MASTER_WIDTH )); then
+    # Re-applied every run, not only on change: a rule for the same selector
+    # replaces the old one rather than stacking, and after a reload only
+    # re-applying brings it back.
+    if hyprctl keyword workspace "m[$name], layout:master, layoutopt:orientation:center" >/dev/null 2>&1; then
+      centred+=("$name")
+      if [[ $current == master && $default_layout != master ]]; then
+        log_skip "$name: already centre-master (${width}px wide)"
+      else
+        log_ok "$name: centre-master layout (${width}px wide)"
+      fi
+    else
+      log_warn "$name: could not apply the centre-master layout"
+    fi
+    continue
+  fi
+
+  for p in ${previously[@]+"${previously[@]}"}; do
+    [[ $p == "$name" ]] || continue
+    if hyprctl keyword workspace "m[$name], layout:$default_layout" >/dev/null 2>&1; then
+      log_ok "$name: back to $default_layout (${width}px wide)"
+    else
+      log_warn "$name: could not take back the centre-master layout"
+      centred+=("$name")
+    fi
+    break
+  done
+done <<<"$rows"
+
+mkdir -p "${centred_list%/*}" 2>/dev/null
+printf '%s\n' ${centred[@]+"${centred[@]}"} > "$centred_list" 2>/dev/null || true

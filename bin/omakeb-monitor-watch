@@ -142,6 +142,11 @@ watch_stream() {
     if (( rc == 0 )); then
       case $line in
         monitoradded*|monitorremoved*) pending=1 ;;
+        # `hyprctl reload` (theme switch, gaps and transparency toggles) drops
+        # every runtime keyword, which puts an 8K panel back on its EDID's 4K
+        # mode and every display back on the default layout. No monitor event
+        # announces that, so the reload itself has to trigger a re-apply.
+        configreloaded*) pending=1 ;;
       esac
     elif (( rc > 128 )); then
       (( pending )) && { settled; pending=0; }

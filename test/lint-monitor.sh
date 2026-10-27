@@ -17,6 +17,9 @@
 #   * the user's own `monitor =` rule has to win, and the COMMENTED examples in
 #     the seeded config must not read as rules, or the policy would opt itself
 #     out on every fresh install.
+#   * the centre-master layout is keyed on LOGICAL width, after scale and
+#     rotation, and a display that stops qualifying has to be handed back —
+#     otherwise a laptop panel that reuses the connector name inherits it.
 #
 # Driven through a fake hyprctl, so no compositor is involved and this runs
 # anywhere the rest of the suite does.
@@ -46,6 +49,18 @@ if [[ "${1:-}" == keyword && "${2:-}" == monitor ]]; then
   printf '%s\n' "$3" >> "$FAKE_CALLS"
   exit 0
 fi
+if [[ "${1:-}" == keyword && "${2:-}" == workspace ]]; then
+  printf '%s\n' "$3" >> "$FAKE_LAYOUT_CALLS"
+  exit 0
+fi
+if [[ "${1:-}" == workspaces && "${2:-}" == -j ]]; then
+  printf '[]\n'
+  exit 0
+fi
+if [[ "${1:-}" == -j && "${2:-}" == getoption ]]; then
+  printf '{"option":"general:layout","str":"dwindle","set":true}\n'
+  exit 0
+fi
 exit 0
 FAKE
 chmod +x "$tmp/bin/hyprctl"
@@ -60,14 +75,46 @@ monitors_json() {
     "$name" "$w" "$h" "$rr" "$sc" "$modes"
 }
 
+# Run the script against $tmp/monitors.json. Every run starts from an empty
+# runtime dir unless KEEP_RUNTIME is set, so "this session centred it" is
+# something a case has to set up on purpose.
+invoke() {
+  : > "$tmp/layout-calls"
+  [[ -n ${KEEP_RUNTIME:-} ]] || { rm -rf "$tmp/run"; mkdir -p "$tmp/run"; }
+  FAKE_MONITORS=$tmp/monitors.json FAKE_CALLS=$tmp/calls \
+  FAKE_LAYOUT_CALLS=$tmp/layout-calls \
+  OMAKEB_CONFIG=$tmp/config XDG_RUNTIME_DIR=$tmp/run \
+  OMAKEB_MONITOR_APPLY_SETTLE=0 \
+  PATH="$tmp/bin:$PATH" ./$SCRIPT_UNDER_TEST >/dev/null 2>&1
+}
+
+# layout_json <name> <w> <h> <scale> [transform] — an output already on the
+# mode we want, so only the layout pass has anything to say.
+layout_json() {
+  printf '[{"name":"%s","width":%s,"height":%s,"refreshRate":60,"scale":%s,"transform":%s,"activeWorkspace":{"id":1},"availableModes":["%sx%s@60.00Hz"]}]\n' \
+    "$1" "$2" "$3" "$4" "${5:-0}" "$2" "$3"
+}
+
+# run_layout <expected-workspace-rule-or-NONE> <label> ; monitors json on stdin
+run_layout() {
+  local want=$1 label=$2 got
+  cat > "$tmp/monitors.json"
+  : > "$tmp/calls"
+  invoke
+  got=$(cat "$tmp/layout-calls")
+  if [[ $want == NONE ]]; then
+    [[ -z $got ]] && ok "$label" || bad "$label: expected no workspace rule, got '$got'"
+  else
+    [[ $got == "$want" ]] && ok "$label" || bad "$label: expected '$want', got '${got:-<nothing>}'"
+  fi
+}
+
 # run <expected-rule-or-SKIP> <label> ; monitors json on stdin
 run() {
   local want=$1 label=$2 got
   cat > "$tmp/monitors.json"
   : > "$tmp/calls"
-  FAKE_MONITORS=$tmp/monitors.json FAKE_CALLS=$tmp/calls \
-  OMAKEB_CONFIG=$tmp/config \
-  PATH="$tmp/bin:$PATH" ./$SCRIPT_UNDER_TEST >/dev/null 2>&1
+  invoke
   got=$(cat "$tmp/calls")
   if [[ $want == SKIP ]]; then
     [[ -z $got ]] && ok "$label" || bad "$label: expected no change, got '$got'"
@@ -130,11 +177,43 @@ X
 monitors_json DP-1 3840 2160 60 1 "7680x4320@59.94Hz" "3840x2160@60.00Hz" |
   run "DP-1,7680x4320@59.94,auto,2" "commented-out examples are not user rules"
 
+# --- centre-master on wide displays -------------------------------------------
+: > "$tmp/config/hyprland.conf"
+CENTRE='m[DP-1], layout:master, layoutopt:orientation:center'
+
+layout_json DP-1 7680 4320 2 | run_layout "$CENTRE" "8K at scale 2 (3840 logical) is centre-master"
+layout_json DP-1 3440 1440 1 | run_layout "$CENTRE" "a 3440 ultrawide is centre-master"
+layout_json DP-1 3840 2160 1 | run_layout "$CENTRE" "4K at scale 1 is centre-master"
+layout_json DP-1 5120 2880 2 | run_layout NONE "5K at scale 2 (2560 logical) keeps the default layout"
+layout_json DP-1 3840 2160 1.5 | run_layout NONE "4K at scale 1.5 (2560 logical) keeps the default layout"
+layout_json DP-1 3840 2160 1 1 | run_layout NONE "a 4K panel rotated to portrait is narrow, not wide"
+
+# Centred, then the connector comes back as something narrow: the rule has to be
+# taken back, or the narrow display inherits a three-column layout.
+layout_json DP-1 7680 4320 2 | run_layout "$CENTRE" "setup: centre DP-1"
+layout_json DP-1 2560 1440 1 | KEEP_RUNTIME=1 run_layout "m[DP-1], layout:dwindle" \
+  "a narrow display on a connector this session centred goes back to the default"
+layout_json DP-1 2560 1440 1 | KEEP_RUNTIME=1 run_layout NONE "...and only once"
+
+# A narrow display this session never centred is not ours to touch.
+layout_json DP-1 2560 1440 1 | run_layout NONE "a narrow display never centred gets no rule"
+
+layout_json DP-1 7680 4320 2 | OMAKEB_CENTER_MASTER_WIDTH=0 run_layout NONE \
+  "OMAKEB_CENTER_MASTER_WIDTH=0 turns the layout policy off"
+
+printf 'workspace = m[DP-1], layout:dwindle\n' > "$tmp/config/hyprland.conf"
+layout_json DP-1 7680 4320 2 | run_layout NONE "a user workspace layout rule opts out"
+printf '# workspace = m[DP-1], layout:dwindle\n' > "$tmp/config/hyprland.conf"
+layout_json DP-1 7680 4320 2 | run_layout "$CENTRE" "a commented-out workspace rule does not opt out"
+: > "$tmp/config/hyprland.conf"
+
 # --- the session actually runs it ---------------------------------------------
 grep -q '^exec-once = omakeb-monitor-apply$' default/hypr/autostart.conf ||
   bad "autostart.conf does not run omakeb-monitor-apply; the policy would never apply at login"
 grep -q 'omakeb-monitor-apply' bin/omakeb-monitor-watch ||
   bad "omakeb-monitor-watch does not re-apply the policy after a hotplug"
+grep -q 'configreloaded' bin/omakeb-monitor-watch ||
+  bad "omakeb-monitor-watch does not re-apply the policy after a reload, which drops every runtime keyword"
 
 echo
 if (( fail )); then
